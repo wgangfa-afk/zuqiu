@@ -1,11 +1,41 @@
 # Football Quant AI V6.0
 
-这是 Football Quant AI 的主仓库，采用三分支职责架构：
+这是 Football Quant AI 的主仓库，正式采用 **A/B 双分区架构**：
 
-- `analysis_engine/`：A — Analysis Engine。负责足球分析、盘口定价、多市场路由、EV、评级、资金池与复盘规则。
-- `data_platform/`：B — Data & Research Platform。由 Codex 工程化实现数据采集、数据库、盘口历史、回测与自动化。
-- `codex_guide/`：C — Codex Dev Guide。用于开发任务、编码规范、验收标准与代码审查。
-- `docs/`：V6.0 分析规范、资金池、复盘、数据质量等长期规范。
+- `analysis_engine/`：**A — Analysis Engine**。负责足球分析、盘口定价、多市场路由、EV、评级、临场判断、资金池与赛后复盘。
+- `data_platform/`：**B — Data & Development Platform**。由 Codex 工程化实现数据采集、数据库、盘口历史、结算、回测、自动化与相关基础设施。
+- `codex_guide/`：属于 **B 分区内部的开发指导与质量控制目录**，用于 Codex 开发任务、编码规范、验收标准、代码与足球业务逻辑审查；它不是独立分区。
+- `docs/`：A/B 共用的 V6.0 分析规范、资金池、复盘、数据质量等长期规范。
+
+## A/B 职责边界
+
+### A — Analysis Engine
+
+A 是决策层，负责：
+- 赛前与临场比赛分析
+- 理论盘口与市场定价
+- Market Router / Cross-Market EV
+- 1X2、亚洲让球、大小球、BTTS、球队进球
+- Corner Engine：总角球、亚洲角球、三项角球、让角、球队角球
+- Card Engine：总牌、球队牌、让牌及裁判因素
+- Match State / Market Refusal / Favorite Trap
+- `S > A+ > A > A- > B+ > B > C > PASS` 评级
+- ¥10,000 月度模拟资金池与仓位决策
+- Execution / Analysis / Counterfactual 全决策复盘
+
+### B — Data & Development Platform
+
+B 是工程与研究基础设施层，负责：
+- 数据采集与多源校验
+- 盘口、水位、欧赔与历史快照数据库
+- 数据质量等级与时间戳
+- 结算引擎与资金账本
+- CLV、ROI、回测与统计
+- 自动报告和复盘基础设施
+- 后续机器学习/研究平台
+- Codex 开发、测试、PR 与验收
+
+**原则：B 为 A 提供可信数据与计算能力，但不得擅自改变 A 的足球分析业务规则。A 的规则变更应先更新规范，再由 B 工程化实现。**
 
 ## 核心原则
 
@@ -20,10 +50,10 @@
 
 ## 当前版本
 
-- Analysis Engine: V6.0
-- Bankroll Engine: V1.0
-- Review Engine: Counterfactual Review V1.0
-- Data Platform: 待 Codex 开发
-- Codex Guide: V1.0
+- A / Analysis Engine: V6.0
+- A / Bankroll Engine: V1.0
+- A / Review Engine: Counterfactual Review V1.0
+- B / Data & Development Platform: Alpha Foundation 开发阶段
+- B / Codex Guide: V1.0
 
-请先阅读 `docs/` 与 `codex_guide/`，再开始代码开发。
+开发前请先阅读 `docs/` 与 `codex_guide/`。`codex_guide/` 从现在起统一视为 B 分区的内部开发规范，不再使用 C 分区称谓。
