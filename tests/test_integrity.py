@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from data_platform.database import Database
+from data_platform.recovery import startup_integrity_check
 from data_platform.domain import DecisionAction, LedgerBook, SettlementOutcome
 
 from .test_ledger import execution_fields
@@ -34,6 +35,7 @@ def test_execution_cannot_be_created_or_locked_at_or_after_kickoff(tmp_path):
     now = ["2026-09-08T09:59:00+00:00"]
     database = Database(tmp_path / "kickoff.sqlite3", clock=lambda: now[0])
     database.initialize()
+    assert startup_integrity_check(database).ok
     fixture_id = database.create_fixture(
         provider="synthetic", provider_fixture_id="kickoff", home_team="Home", away_team="Away",
         kickoff_at_utc="2026-09-08T10:00:00+00:00",
@@ -57,6 +59,7 @@ def test_post_kickoff_pass_or_watch_cannot_be_backfilled_as_bet(tmp_path):
     now = ["2026-09-08T09:59:00+00:00"]
     database = Database(tmp_path / "backfill.sqlite3", clock=lambda: now[0])
     database.initialize()
+    assert startup_integrity_check(database).ok
     fixture_id = database.create_fixture(
         provider="synthetic", provider_fixture_id="backfill", home_team="Home", away_team="Away",
         kickoff_at_utc="2026-09-08T10:00:00+00:00",

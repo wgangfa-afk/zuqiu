@@ -3,12 +3,14 @@ from __future__ import annotations
 import pytest
 
 from data_platform.database import Database
+from data_platform.recovery import startup_integrity_check
 
 
 @pytest.fixture()
 def database(tmp_path):
     db = Database(tmp_path / "alpha.sqlite3")
     db.initialize()
+    assert startup_integrity_check(db).ok
     return db
 
 

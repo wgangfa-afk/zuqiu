@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from data_platform.domain import DecisionAction, SettlementOutcome
+from data_platform.database import Database
 from data_platform.recovery import create_backup, rebuild_bankroll, restore_backup, startup_integrity_check
 
 from .test_ledger import execution_fields
@@ -63,3 +64,18 @@ def test_crash_after_settlement_is_transactionally_consistent(database, fixture_
     execution_id = locked_execution(database, fixture_id)
     database.add_settlement(execution_id=execution_id, outcome=SettlementOutcome.PUSH, result_payload_reference="synthetic://ft")
     assert startup_integrity_check(database).ok
+
+
+def test_new_process_is_fail_closed_until_rechecked(tmp_path):
+    path = tmp_path / "restart.sqlite3"
+    first = Database(path)
+    first.initialize()
+    fixture_id = first.create_fixture(provider="synthetic", provider_fixture_id="restart", home_team="H", away_team="A", kickoff_at_utc="2026-09-08T10:00:00+00:00")
+    with pytest.raises(RuntimeError, match="UNVERIFIED"):
+        first.create_execution(action=DecisionAction.BET, **execution_fields(fixture_id))
+    assert startup_integrity_check(first).ok
+    first.create_execution(action=DecisionAction.BET, **execution_fields(fixture_id))
+    restarted = Database(path)
+    with pytest.raises(RuntimeError, match="UNVERIFIED"):
+        restarted.create_execution(action=DecisionAction.BET, **execution_fields(fixture_id))
+    assert startup_integrity_check(restarted).ok

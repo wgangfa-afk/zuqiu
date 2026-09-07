@@ -101,6 +101,11 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     payload_json TEXT NOT NULL,
     created_at_utc TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS system_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS bankroll_ledger (
     id TEXT PRIMARY KEY,
     execution_id TEXT NOT NULL REFERENCES executions(id),
@@ -177,7 +182,7 @@ class Database:
     def __init__(self, path: str | Path, clock: Callable[[], str] = utc_now) -> None:
         self.path = str(path)
         self._clock = clock
-        self.recovery_required = False
+        self.health_state = "UNVERIFIED"
 
     def _now(self) -> str:
         return normalize_utc(self._clock())
@@ -225,11 +230,24 @@ class Database:
             )
 
     def require_recovery(self) -> None:
-        self.recovery_required = True
+        self.health_state = "RECOVERY_REQUIRED"
+        try:
+            with self.connection() as connection:
+                connection.execute("INSERT OR REPLACE INTO system_state VALUES ('database_health_state', 'RECOVERY_REQUIRED', ?)", (self._now(),))
+        except sqlite3.DatabaseError:
+            pass
+
+    def mark_healthy(self, result: str = "passed") -> None:
+        self.health_state = "HEALTHY"
+        with self.connection() as connection:
+            now = self._now()
+            connection.execute("INSERT OR REPLACE INTO system_state VALUES ('database_health_state', 'HEALTHY', ?)", (now,))
+            connection.execute("INSERT OR REPLACE INTO system_state VALUES ('last_integrity_check_at', ?, ?)", (now, now))
+            connection.execute("INSERT OR REPLACE INTO system_state VALUES ('last_integrity_check_result', ?, ?)", (result, now))
 
     def _assert_writable(self) -> None:
-        if self.recovery_required:
-            raise RuntimeError("RECOVERY_REQUIRED: formal writes are blocked")
+        if self.health_state != "HEALTHY":
+            raise RuntimeError(f"{self.health_state}: formal writes are blocked pending integrity verification")
 
     def create_fixture(self, *, provider: str, provider_fixture_id: str, home_team: str, away_team: str, kickoff_at_utc: str) -> str:
         fixture_id = str(uuid4())
