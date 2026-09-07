@@ -57,3 +57,17 @@ B 是工程与研究基础设施层，负责：
 - B / Codex Guide: V1.0
 
 开发前请先阅读 `docs/` 与 `codex_guide/`。`codex_guide/` 从现在起统一视为 B 分区的内部开发规范，不再使用 C 分区称谓。
+
+## Alpha Foundation（FQ-V6-001）
+
+本仓库的 Alpha Foundation 位于 `data_platform/`，只提供 B 分区的 SQLite、结算、三账隔离与模拟账本能力；不采集真实盘口，也不生成预测概率。
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+python -m data_platform health
+pytest
+```
+
+默认数据库是当前目录的 `football_quant.sqlite3`。也可通过 `.env` 设定 `DATABASE_URL=sqlite:///path/to/file.sqlite3`。所有内部时间字段使用 UTC；`TIMEZONE` 仅用于展示层的默认时区。
