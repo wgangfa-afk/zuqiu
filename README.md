@@ -71,3 +71,21 @@ pytest
 ```
 
 默认数据库是当前目录的 `football_quant.sqlite3`。也可通过 `.env` 设定 `DATABASE_URL=sqlite:///path/to/file.sqlite3`。所有内部时间字段使用 UTC；`TIMEZONE` 仅用于展示层的默认时区。
+
+## Recoverability（FQ-V6-002）
+
+`data_platform.recovery` 提供 SQLite 一致性备份、manifest SHA-256 校验、向全新路径恢复、启动完整性检查与资金账本重建。备份必须放在 Git 仓库外：
+
+```python
+from pathlib import Path
+from data_platform.database import Database
+from data_platform.recovery import create_backup, restore_backup, startup_integrity_check
+
+db = Database("football_quant.sqlite3")
+db.initialize()
+assert startup_integrity_check(db).ok
+manifest = create_backup(db, Path("../backup/manual"))
+restored = restore_backup(manifest, Path("../recovery-test.sqlite3"))
+```
+
+任何完整性失败都会使当前 `Database` 进入 `RECOVERY_REQUIRED`，阻止正式 Execution、锁单、结算和盘口快照写入；必须恢复到新数据库并重新通过检查后才可恢复运行。

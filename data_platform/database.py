@@ -93,6 +93,14 @@ CREATE TABLE IF NOT EXISTS review_records (
     created_at_utc TEXT NOT NULL,
     notes TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    entity_type TEXT,
+    entity_id TEXT,
+    payload_json TEXT NOT NULL,
+    created_at_utc TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS bankroll_ledger (
     id TEXT PRIMARY KEY,
     execution_id TEXT NOT NULL REFERENCES executions(id),
@@ -169,6 +177,7 @@ class Database:
     def __init__(self, path: str | Path, clock: Callable[[], str] = utc_now) -> None:
         self.path = str(path)
         self._clock = clock
+        self.recovery_required = False
 
     def _now(self) -> str:
         return normalize_utc(self._clock())
@@ -206,7 +215,21 @@ class Database:
                 connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             connection.executescript(SCHEMA)
             connection.execute("DELETE FROM schema_version")
-            connection.execute("INSERT INTO schema_version(version) VALUES (2)")
+            connection.execute("INSERT INTO schema_version(version) VALUES (3)")
+
+    def record_audit(self, event_type: str, *, entity_type: str | None = None, entity_id: str | None = None, payload_json: str = "{}") -> None:
+        with self.connection() as connection:
+            connection.execute(
+                "INSERT INTO audit_logs VALUES (?, ?, ?, ?, ?, ?)",
+                (str(uuid4()), event_type, entity_type, entity_id, payload_json, self._now()),
+            )
+
+    def require_recovery(self) -> None:
+        self.recovery_required = True
+
+    def _assert_writable(self) -> None:
+        if self.recovery_required:
+            raise RuntimeError("RECOVERY_REQUIRED: formal writes are blocked")
 
     def create_fixture(self, *, provider: str, provider_fixture_id: str, home_team: str, away_team: str, kickoff_at_utc: str) -> str:
         fixture_id = str(uuid4())
@@ -219,6 +242,7 @@ class Database:
 
     def append_market_snapshot(self, **snapshot: object) -> str:
         """Snapshots are insert-only; callers must supply external source/provider metadata."""
+        self._assert_writable()
         required = {"fixture_id", "provider", "source_reference", "market_type", "settlement_type", "selection", "decimal_odds", "observed_at_utc", "raw_payload_hash", "validation_status", "mapping_version"}
         missing = required.difference(snapshot)
         if missing:
@@ -247,6 +271,7 @@ class Database:
         return decision_id
 
     def create_execution(self, *, action: DecisionAction, **fields: object) -> str:
+        self._assert_writable()
         if action is not DecisionAction.BET:
             raise ValueError("Only an explicit pre-match BET can create an Execution")
         forbidden = {"created_at_utc", "locked_at_utc", "status"}.intersection(fields)
@@ -261,9 +286,11 @@ class Database:
                 {"id": execution_id, "line": None, "created_at_utc": created_at_utc, "locked_at_utc": None,
                  "status": ExecutionStatus.DRAFT.value, **fields},
             )
+        self.record_audit("execution_created", entity_type="execution", entity_id=execution_id)
         return execution_id
 
     def lock_execution(self, execution_id: str, locked_at_utc: str | None = None) -> None:
+        self._assert_writable()
         with self.connection() as connection:
             execution = connection.execute("SELECT fixture_id, stake_u FROM executions WHERE id = ?", (execution_id,)).fetchone()
             if execution is None:
@@ -283,6 +310,7 @@ class Database:
                 "INSERT INTO bankroll_ledger VALUES (?, ?, 'stake', ?, ?)",
                 (str(uuid4()), execution_id, -float(execution["stake_u"]), lock_time),
             )
+        self.record_audit("execution_locked", entity_type="execution", entity_id=execution_id)
 
     def update_execution_draft(self, execution_id: str, **changes: object) -> None:
         allowed = {"fixture_id", "market_type", "settlement_type", "selection", "line", "odds", "rating", "ev", "stake_u", "stake_cny", "source_reference"}
@@ -307,8 +335,14 @@ class Database:
         clv: float | None = None,
         expected_pnl_u: float | None = None,
     ) -> str:
+        self._assert_writable()
         settlement_id = str(uuid4())
         with self.connection() as connection:
+            existing = connection.execute("SELECT id, outcome FROM settlements WHERE execution_id = ?", (execution_id,)).fetchone()
+            if existing is not None:
+                if existing["outcome"] == outcome.value:
+                    return existing["id"]
+                raise ValueError("Conflicting settlement already exists for execution")
             row = connection.execute("SELECT status, stake_u, odds FROM executions WHERE id = ?", (execution_id,)).fetchone()
             if row is None or row["status"] != ExecutionStatus.LOCKED.value:
                 raise ValueError("Only locked executions can be settled")
@@ -319,6 +353,7 @@ class Database:
             connection.execute("INSERT INTO settlements VALUES (?, ?, ?, ?, ?, ?, ?)", (settlement_id, execution_id, outcome.value, result_payload_reference, settled_at_utc, calculated_pnl, clv))
             connection.execute("INSERT INTO bankroll_ledger VALUES (?, ?, 'pnl', ?, ?)", (str(uuid4()), execution_id, calculated_pnl, settled_at_utc))
             connection.execute("UPDATE executions SET status = ? WHERE id = ?", (ExecutionStatus.SETTLED.value, execution_id))
+        self.record_audit("settlement_created", entity_type="execution", entity_id=execution_id)
         return settlement_id
 
     def official_performance(self) -> dict[str, float]:
