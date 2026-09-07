@@ -6,10 +6,11 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 from uuid import uuid4
 
 from .domain import DecisionAction, ExecutionStatus, LedgerBook, SettlementOutcome
+from .settlement import pnl_for
 
 
 SCHEMA = """
@@ -95,22 +96,49 @@ CREATE TABLE IF NOT EXISTS bankroll_ledger (
     execution_id TEXT NOT NULL REFERENCES executions(id),
     entry_type TEXT NOT NULL CHECK(entry_type IN ('stake', 'pnl')),
     amount_u REAL NOT NULL,
-    created_at_utc TEXT NOT NULL
+    created_at_utc TEXT NOT NULL,
+    UNIQUE(execution_id, entry_type)
 );
+CREATE TRIGGER IF NOT EXISTS market_snapshots_are_append_only_update
+BEFORE UPDATE ON market_snapshots
+BEGIN SELECT RAISE(ABORT, 'market snapshots are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS market_snapshots_are_append_only_delete
+BEFORE DELETE ON market_snapshots
+BEGIN SELECT RAISE(ABORT, 'market snapshots are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS execution_must_be_created_pre_kickoff
+BEFORE INSERT ON executions
+WHEN NEW.created_at_utc >= (SELECT kickoff_at_utc FROM fixtures WHERE id = NEW.fixture_id)
+BEGIN SELECT RAISE(ABORT, 'execution must be created before fixture kickoff'); END;
+CREATE TRIGGER IF NOT EXISTS execution_starts_as_draft
+BEFORE INSERT ON executions
+WHEN NEW.status != 'draft' OR NEW.locked_at_utc IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'new execution must start as an unlocked draft'); END;
 CREATE TRIGGER IF NOT EXISTS locked_execution_is_immutable
 BEFORE UPDATE ON executions
 WHEN OLD.locked_at_utc IS NOT NULL AND (
     NEW.fixture_id != OLD.fixture_id OR NEW.market_type != OLD.market_type OR
     NEW.settlement_type != OLD.settlement_type OR NEW.selection != OLD.selection OR
     NEW.line IS NOT OLD.line OR NEW.odds != OLD.odds OR NEW.rating != OLD.rating OR
-    NEW.ev != OLD.ev OR NEW.stake_u != OLD.stake_u OR NEW.created_at_utc != OLD.created_at_utc OR
+    NEW.ev != OLD.ev OR NEW.stake_u != OLD.stake_u OR NEW.stake_cny != OLD.stake_cny OR
+    NEW.source_reference != OLD.source_reference OR NEW.created_at_utc != OLD.created_at_utc OR
     NEW.locked_at_utc IS NOT OLD.locked_at_utc
 )
 BEGIN SELECT RAISE(ABORT, 'locked execution pre-match fields are immutable'); END;
-CREATE TRIGGER IF NOT EXISTS execution_must_stay_execution_book
-BEFORE INSERT ON executions
-WHEN NEW.status NOT IN ('draft', 'locked', 'settled')
-BEGIN SELECT RAISE(ABORT, 'invalid execution status'); END;
+CREATE TRIGGER IF NOT EXISTS execution_lock_must_precede_kickoff
+BEFORE UPDATE ON executions
+WHEN NEW.status = 'locked' AND (
+    NEW.locked_at_utc IS NULL OR
+    NEW.locked_at_utc >= (SELECT kickoff_at_utc FROM fixtures WHERE id = NEW.fixture_id)
+)
+BEGIN SELECT RAISE(ABORT, 'execution must be locked before fixture kickoff'); END;
+CREATE TRIGGER IF NOT EXISTS execution_status_is_forward_only
+BEFORE UPDATE OF status ON executions
+WHEN NOT (
+    (OLD.status = 'draft' AND NEW.status IN ('draft', 'locked')) OR
+    (OLD.status = 'locked' AND NEW.status IN ('locked', 'settled')) OR
+    (OLD.status = 'settled' AND NEW.status = 'settled')
+)
+BEGIN SELECT RAISE(ABORT, 'execution status transition is invalid'); END;
 """
 
 
@@ -118,9 +146,34 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def normalize_utc(value: str) -> str:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamps must be timezone-aware UTC values")
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 class Database:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, clock: Callable[[], str] = utc_now) -> None:
         self.path = str(path)
+        self._clock = clock
+
+    def _now(self) -> str:
+        return normalize_utc(self._clock())
+
+    @staticmethod
+    def _kickoff_at(connection: sqlite3.Connection, fixture_id: str) -> str:
+        fixture = connection.execute("SELECT kickoff_at_utc FROM fixtures WHERE id = ?", (fixture_id,)).fetchone()
+        if fixture is None:
+            raise ValueError("Fixture not found")
+        return fixture["kickoff_at_utc"]
+
+    def _require_pre_kickoff(self, connection: sqlite3.Connection, fixture_id: str, occurred_at_utc: str) -> str:
+        timestamp = normalize_utc(occurred_at_utc)
+        kickoff = self._kickoff_at(connection, fixture_id)
+        if timestamp >= kickoff:
+            raise ValueError("Formal Execution must be created and locked before fixture kickoff")
+        return timestamp
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -141,7 +194,7 @@ class Database:
         with self.connection() as connection:
             connection.execute(
                 "INSERT INTO fixtures VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (fixture_id, provider, provider_fixture_id, home_team, away_team, kickoff_at_utc, utc_now()),
+                (fixture_id, provider, provider_fixture_id, home_team, away_team, normalize_utc(kickoff_at_utc), self._now()),
             )
         return fixture_id
 
@@ -154,10 +207,10 @@ class Database:
         snapshot_id = str(uuid4())
         with self.connection() as connection:
             connection.execute(
-                """INSERT INTO market_snapshots VALUES (?, :fixture_id, :provider, :source_reference, :market_type,
+                """INSERT INTO market_snapshots VALUES (:id, :fixture_id, :provider, :source_reference, :market_type,
                 :settlement_type, :selection, :line, :decimal_odds, :observed_at_utc, :fetched_at_utc,
                 :raw_payload_hash, :validation_status, :mapping_version)""",
-                {"id": snapshot_id, "line": None, "fetched_at_utc": utc_now(), **snapshot},
+                {"id": snapshot_id, "line": None, "fetched_at_utc": self._now(), **snapshot},
             )
         return snapshot_id
 
@@ -170,33 +223,47 @@ class Database:
                 """INSERT INTO analysis_decisions VALUES (:id, :fixture_id, :book, :action, :market_type, :selection,
                 :line, :odds, :rating, :ev, :created_at_utc, :locked_at_utc, :source_reference)""",
                 {"id": decision_id, "book": book.value, "action": action.value, "line": None, "odds": None,
-                 "ev": None, "created_at_utc": utc_now(), "locked_at_utc": None, **fields},
+                 "ev": None, "created_at_utc": self._now(), "locked_at_utc": None, **fields},
             )
         return decision_id
 
     def create_execution(self, *, action: DecisionAction, **fields: object) -> str:
         if action is not DecisionAction.BET:
             raise ValueError("Only an explicit pre-match BET can create an Execution")
+        forbidden = {"created_at_utc", "locked_at_utc", "status"}.intersection(fields)
+        if forbidden:
+            raise ValueError(f"Execution lifecycle fields are system-managed: {sorted(forbidden)}")
         execution_id = str(uuid4())
-        stake_u = float(fields["stake_u"])
         with self.connection() as connection:
+            created_at_utc = self._require_pre_kickoff(connection, str(fields["fixture_id"]), self._now())
             connection.execute(
                 """INSERT INTO executions VALUES (:id, :fixture_id, :market_type, :settlement_type, :selection, :line,
                 :odds, :rating, :ev, :stake_u, :stake_cny, :source_reference, :created_at_utc, :locked_at_utc, :status)""",
-                {"id": execution_id, "line": None, "created_at_utc": utc_now(), "locked_at_utc": None,
+                {"id": execution_id, "line": None, "created_at_utc": created_at_utc, "locked_at_utc": None,
                  "status": ExecutionStatus.DRAFT.value, **fields},
             )
-            connection.execute("INSERT INTO bankroll_ledger VALUES (?, ?, 'stake', ?, ?)", (str(uuid4()), execution_id, -stake_u, utc_now()))
         return execution_id
 
     def lock_execution(self, execution_id: str, locked_at_utc: str | None = None) -> None:
         with self.connection() as connection:
+            execution = connection.execute("SELECT fixture_id, stake_u FROM executions WHERE id = ?", (execution_id,)).fetchone()
+            if execution is None:
+                raise ValueError("Execution is missing or already locked")
+            lock_time = self._require_pre_kickoff(
+                connection,
+                execution["fixture_id"],
+                locked_at_utc or self._now(),
+            )
             result = connection.execute(
                 "UPDATE executions SET locked_at_utc = ?, status = ? WHERE id = ? AND locked_at_utc IS NULL",
-                (locked_at_utc or utc_now(), ExecutionStatus.LOCKED.value, execution_id),
+                (lock_time, ExecutionStatus.LOCKED.value, execution_id),
             )
             if result.rowcount != 1:
                 raise ValueError("Execution is missing or already locked")
+            connection.execute(
+                "INSERT INTO bankroll_ledger VALUES (?, ?, 'stake', ?, ?)",
+                (str(uuid4()), execution_id, -float(execution["stake_u"]), lock_time),
+            )
 
     def update_execution_draft(self, execution_id: str, **changes: object) -> None:
         allowed = {"fixture_id", "market_type", "settlement_type", "selection", "line", "odds", "rating", "ev", "stake_u", "stake_cny", "source_reference"}
@@ -212,14 +279,26 @@ class Database:
             assignments = ", ".join(f"{field} = ?" for field in changes)
             connection.execute(f"UPDATE executions SET {assignments} WHERE id = ?", (*changes.values(), execution_id))
 
-    def add_settlement(self, *, execution_id: str, outcome: SettlementOutcome, result_payload_reference: str, pnl_u: float, clv: float | None = None) -> str:
+    def add_settlement(
+        self,
+        *,
+        execution_id: str,
+        outcome: SettlementOutcome,
+        result_payload_reference: str,
+        clv: float | None = None,
+        expected_pnl_u: float | None = None,
+    ) -> str:
         settlement_id = str(uuid4())
         with self.connection() as connection:
-            row = connection.execute("SELECT status FROM executions WHERE id = ?", (execution_id,)).fetchone()
+            row = connection.execute("SELECT status, stake_u, odds FROM executions WHERE id = ?", (execution_id,)).fetchone()
             if row is None or row["status"] != ExecutionStatus.LOCKED.value:
                 raise ValueError("Only locked executions can be settled")
-            connection.execute("INSERT INTO settlements VALUES (?, ?, ?, ?, ?, ?, ?)", (settlement_id, execution_id, outcome.value, result_payload_reference, utc_now(), pnl_u, clv))
-            connection.execute("INSERT INTO bankroll_ledger VALUES (?, ?, 'pnl', ?, ?)", (str(uuid4()), execution_id, pnl_u, utc_now()))
+            calculated_pnl = pnl_for(row["stake_u"], row["odds"], outcome)
+            if expected_pnl_u is not None and abs(expected_pnl_u - calculated_pnl) > 1e-9:
+                raise ValueError("expected_pnl_u does not match system-calculated PnL")
+            settled_at_utc = self._now()
+            connection.execute("INSERT INTO settlements VALUES (?, ?, ?, ?, ?, ?, ?)", (settlement_id, execution_id, outcome.value, result_payload_reference, settled_at_utc, calculated_pnl, clv))
+            connection.execute("INSERT INTO bankroll_ledger VALUES (?, ?, 'pnl', ?, ?)", (str(uuid4()), execution_id, calculated_pnl, settled_at_utc))
             connection.execute("UPDATE executions SET status = ? WHERE id = ?", (ExecutionStatus.SETTLED.value, execution_id))
         return settlement_id
 

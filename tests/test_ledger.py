@@ -64,10 +64,5 @@ def test_analysis_and_counterfactual_do_not_enter_official_roi(database, fixture
 def test_execution_pnl_and_roi_only_use_settled_execution(database, fixture_id):
     execution_id = database.create_execution(action=DecisionAction.BET, **execution_fields(fixture_id))
     database.lock_execution(execution_id)
-    database.add_settlement(
-        execution_id=execution_id,
-        outcome=SettlementOutcome.HALF_WIN,
-        result_payload_reference="synthetic://ft-result",
-        pnl_u=0.45,
-    )
+    database.add_settlement(execution_id=execution_id, outcome=SettlementOutcome.HALF_WIN, result_payload_reference="synthetic://ft-result")
     assert database.official_performance() == {"pnl_u": 0.45, "stake_u": 1.0, "roi": 0.45}
