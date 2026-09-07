@@ -166,7 +166,6 @@ TRIGGER_NAMES = (
     "execution_status_is_forward_only",
 )
 
-
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -214,13 +213,29 @@ class Database:
 
     def initialize(self) -> None:
         with self.connection() as connection:
-            # Recreate named constraints so a database initialized by an older
-            # Alpha build receives the latest trigger definitions as well.
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            # An empty path is a new database.  Any non-empty database without a
+            # compatible version is deliberately left untouched: a future
+            # migration must make that transition explicitly, with a backup.
+            if not tables:
+                connection.executescript(SCHEMA)
+                connection.execute("INSERT INTO schema_version(version) VALUES (3)")
+                return
+            if "schema_version" not in tables:
+                return
+            versions = [row[0] for row in connection.execute("SELECT version FROM schema_version")]
+            if versions != [3]:
+                return
+            # A current-version database may receive repaired trigger bodies,
+            # but initialization never rewrites its declared schema version.
             for trigger in TRIGGER_NAMES:
                 connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             connection.executescript(SCHEMA)
-            connection.execute("DELETE FROM schema_version")
-            connection.execute("INSERT INTO schema_version(version) VALUES (3)")
 
     def record_audit(self, event_type: str, *, entity_type: str | None = None, entity_id: str | None = None, payload_json: str = "{}") -> None:
         with self.connection() as connection:
