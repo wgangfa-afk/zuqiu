@@ -14,7 +14,9 @@ from .settlement import pnl_for
 
 
 SCHEMA = """
-PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS fixtures (
     id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
@@ -141,6 +143,16 @@ WHEN NOT (
 BEGIN SELECT RAISE(ABORT, 'execution status transition is invalid'); END;
 """
 
+TRIGGER_NAMES = (
+    "market_snapshots_are_append_only_update",
+    "market_snapshots_are_append_only_delete",
+    "execution_must_be_created_pre_kickoff",
+    "execution_starts_as_draft",
+    "locked_execution_is_immutable",
+    "execution_lock_must_precede_kickoff",
+    "execution_status_is_forward_only",
+)
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -179,6 +191,7 @@ class Database:
     def connection(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         try:
             yield connection
             connection.commit()
@@ -187,7 +200,13 @@ class Database:
 
     def initialize(self) -> None:
         with self.connection() as connection:
+            # Recreate named constraints so a database initialized by an older
+            # Alpha build receives the latest trigger definitions as well.
+            for trigger in TRIGGER_NAMES:
+                connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             connection.executescript(SCHEMA)
+            connection.execute("DELETE FROM schema_version")
+            connection.execute("INSERT INTO schema_version(version) VALUES (2)")
 
     def create_fixture(self, *, provider: str, provider_fixture_id: str, home_team: str, away_team: str, kickoff_at_utc: str) -> str:
         fixture_id = str(uuid4())

@@ -145,3 +145,24 @@ def test_execution_status_cannot_move_backward(database, fixture_id):
         for invalid_status in ("locked", "draft"):
             with pytest.raises(sqlite3.IntegrityError, match="transition"):
                 connection.execute("UPDATE executions SET status = ? WHERE id = ?", (invalid_status, execution_id))
+
+
+def test_every_connection_enforces_foreign_keys(database):
+    with database.connection() as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO executions VALUES (?, ?, 'asian_total', 'asian', 'over', 2.5, 1.9, 'A', 0.1, 1, 100, 'synthetic://x', '2026-09-08T09:00:00+00:00', NULL, 'draft')",
+                ("orphan", "missing-fixture"),
+            )
+
+
+def test_initialize_refreshes_existing_trigger_definitions(database, fixture_id):
+    with database.connection() as connection:
+        connection.execute("DROP TRIGGER locked_execution_is_immutable")
+        connection.execute("CREATE TRIGGER locked_execution_is_immutable BEFORE UPDATE ON executions WHEN OLD.locked_at_utc IS NOT NULL BEGIN SELECT RAISE(ABORT, 'old trigger'); END")
+    database.initialize()
+    execution_id = database.create_execution(action=DecisionAction.BET, **execution_fields(fixture_id))
+    database.lock_execution(execution_id, "2026-09-08T09:59:00+00:00")
+    with database.connection() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute("UPDATE executions SET stake_cny = 200 WHERE id = ?", (execution_id,))
