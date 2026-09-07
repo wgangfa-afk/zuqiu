@@ -158,6 +158,10 @@ Settlement 必须由 `execution_id` 唯一约束。
 
 不得仅相信缓存余额。
 
+### 10.1 净 PnL 账本语义
+
+正式余额使用净 PnL 模型。`stake` ledger 是锁单时的 exposure/turnover 事实，不能当作已实现损失加入 bankroll balance；`pnl` ledger 与 Settlement 的 `pnl_u` 都必须等于由 immutable `stake_u`、`odds` 和 outcome 重算得到的净 PnL。余额等于初始资金加所有已结算净 PnL；ROI 分母为已结算 Execution 的 stake 周转额。
+
 ## 11. Export / Import
 
 至少提供一种可审计导出格式（建议 JSONL 或 CSV + manifest），覆盖 P0 数据。
@@ -229,3 +233,7 @@ Recoverability 建设完成时必须证明：
 - 实时热备
 
 先把 **单机 SQLite 的可恢复性、幂等、审计、备份、恢复、校验** 做正确。
+
+## 17. Checksum 威胁模型
+
+SHA-256、行数和关键表 canonical digest 用于检测意外损坏、不完整发布和数据库/manifest 不一致。它们不是签名，不保证来源真实性，也不能抵御可同时重写备份数据库与 manifest 的攻击者。本阶段保留 manifest version 与签名/HMAC 扩展字段，但不实现密钥管理或签名验证。
