@@ -28,12 +28,28 @@ class MarketGroup:
 
 @dataclass(frozen=True, slots=True)
 class PricedSelection:
-    fixture_id: str; snapshot_id: str; market_key: str; market_type: str; settlement_type: str
-    selection: str; line: float | None; market_odds: float; market_implied_probability: float
-    devig_market_probability: float; model_probability: float; fair_odds: float; raw_ev: float
-    uncertainty_penalty: float; data_quality_penalty: float; correlation_penalty: float
-    risk_adjusted_ev: float; rating: str; action: DecisionAction; reason_codes: tuple[ReasonCode, ...]
-    source_reference: str; observed_at_utc: datetime
+    fixture_id: str
+    snapshot_id: str
+    market_key: str
+    market_type: str
+    settlement_type: str
+    selection: str
+    line: float | None
+    market_odds: float
+    market_implied_probability: float | None
+    devig_market_probability: float | None
+    model_probability: float
+    fair_odds: float | None
+    raw_ev: float | None
+    uncertainty_penalty: float
+    data_quality_penalty: float
+    correlation_penalty: float
+    risk_adjusted_ev: float | None
+    rating: str
+    action: DecisionAction
+    reason_codes: tuple[ReasonCode, ...]
+    source_reference: str
+    observed_at_utc: datetime
 
 
 @dataclass(frozen=True, slots=True)
