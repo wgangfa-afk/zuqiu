@@ -50,4 +50,3 @@ ThreeWaySelection = Literal["over", "exactly", "under"]
 class SettlementResult:
     outcome: SettlementOutcome
     net_pnl: float
-
