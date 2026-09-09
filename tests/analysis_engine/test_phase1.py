@@ -64,3 +64,32 @@ def test_positive_edge_below_watch_threshold_has_truthful_pass_reason(database, 
     assert ReasonCode.NO_POSITIVE_EDGE not in candidate.reason_codes
     assert ReasonCode.BELOW_WATCH_THRESHOLD in result.reason_codes
     assert ReasonCode.NO_POSITIVE_EDGE not in result.reason_codes
+
+
+@pytest.mark.parametrize("probability, penalty, expects_penalty", [(.5, 0.0, False), (.45, 0.0, False), (.55, .10, True), (.55, .11, True)])
+def test_non_watch_edges_have_factful_reason_codes(database, fixture_id, probability, penalty, expects_penalty):
+    home, away = add(database, fixture_id, "home", 2.0), add(database, fixture_id, "away", 2.0)
+    result = service(database).analyze(fixture_id=fixture_id, market_groups=(MarketGroup(fixture_id, "edge", (home, away), True, True),), model_probabilities=(ModelProbability(home, probability, uncertainty_penalty=penalty), ModelProbability(away, 1-probability)), generated_at_utc=datetime(2026, 9, 8, tzinfo=timezone.utc))
+    candidate = next(item for item in result.ranked_candidates if item.snapshot_id == home)
+    if candidate.risk_adjusted_ev <= 0:
+        assert ReasonCode.NO_POSITIVE_EDGE in candidate.reason_codes
+        assert ReasonCode.BELOW_WATCH_THRESHOLD not in candidate.reason_codes
+    if expects_penalty:
+        assert ReasonCode.POSITIVE_RAW_EV in candidate.reason_codes
+        assert ReasonCode.PENALTY_EXCEEDS_RAW_EDGE in candidate.reason_codes
+        assert result.selected is None
+    else:
+        assert ReasonCode.PENALTY_EXCEEDS_RAW_EDGE not in candidate.reason_codes
+
+
+def test_hard_rejection_and_valid_c_reasons_are_stable_tuples(database, fixture_id):
+    stale_home, stale_away = add(database, fixture_id, "home", 2.0, status="STALE"), add(database, fixture_id, "away", 2.0, status="STALE")
+    c_home, c_away = add(database, fixture_id, "yes", 2.0, market="btts"), add(database, fixture_id, "no", 2.0, market="btts")
+    args = dict(fixture_id=fixture_id, market_groups=(MarketGroup(fixture_id, "stale", (stale_home, stale_away), True, True), MarketGroup(fixture_id, "c", (c_home, c_away), True, True)), model_probabilities=(ModelProbability(stale_home,.55), ModelProbability(stale_away,.45), ModelProbability(c_home,.505), ModelProbability(c_away,.495)), generated_at_utc=datetime(2026,9,8,tzinfo=timezone.utc))
+    first, second = service(database).analyze(**args), service(database).analyze(**args)
+    assert first.selected is None
+    assert ReasonCode.STALE_MARKET_DATA in first.reason_codes
+    assert ReasonCode.BELOW_WATCH_THRESHOLD in first.reason_codes
+    assert isinstance(first.reason_codes, tuple) and len(first.reason_codes) == len(set(first.reason_codes))
+    assert first.reason_codes == second.reason_codes
+    assert all(isinstance(item.reason_codes, tuple) for item in first.ranked_candidates)
