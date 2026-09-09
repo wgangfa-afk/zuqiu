@@ -175,6 +175,22 @@ CREATE TABLE IF NOT EXISTS lineup_observations (
     observed_at_utc TEXT NOT NULL, validation_status TEXT NOT NULL, raw_payload_hash TEXT NOT NULL,
     mapping_version TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE
 );
+CREATE TABLE IF NOT EXISTS ingestion_runs (
+    id TEXT PRIMARY KEY, provider TEXT NOT NULL, sport_key TEXT NOT NULL, endpoint_type TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL, started_at_utc TEXT NOT NULL, completed_at_utc TEXT,
+    status TEXT NOT NULL, http_status INTEGER, records_received INTEGER NOT NULL DEFAULT 0,
+    records_written INTEGER NOT NULL DEFAULT 0, records_rejected INTEGER NOT NULL DEFAULT 0,
+    error_code TEXT, quota_remaining INTEGER, quota_used INTEGER, quota_last INTEGER,
+    raw_payload_hash TEXT, UNIQUE(provider, request_fingerprint, raw_payload_hash)
+);
+CREATE TABLE IF NOT EXISTS raw_provider_payloads (
+    id TEXT PRIMARY KEY, ingestion_run_id TEXT NOT NULL REFERENCES ingestion_runs(id), provider TEXT NOT NULL,
+    content_type TEXT NOT NULL, payload_json TEXT NOT NULL, payload_sha256 TEXT NOT NULL,
+    received_at_utc TEXT NOT NULL, UNIQUE(provider, payload_sha256)
+);
+CREATE TABLE IF NOT EXISTS ingested_snapshot_keys (
+    idempotency_key TEXT PRIMARY KEY, snapshot_id TEXT NOT NULL REFERENCES market_snapshots(id)
+);
 CREATE TRIGGER IF NOT EXISTS market_snapshots_are_append_only_update
 BEFORE UPDATE ON market_snapshots
 BEGIN SELECT RAISE(ABORT, 'market snapshots are append-only'); END;
@@ -235,6 +251,10 @@ CREATE TRIGGER IF NOT EXISTS player_availability_observations_append_only_update
 CREATE TRIGGER IF NOT EXISTS player_availability_observations_append_only_delete BEFORE DELETE ON player_availability_observations BEGIN SELECT RAISE(ABORT, 'player availability observations are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS lineup_observations_append_only_update BEFORE UPDATE ON lineup_observations BEGIN SELECT RAISE(ABORT, 'lineup observations are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS lineup_observations_append_only_delete BEFORE DELETE ON lineup_observations BEGIN SELECT RAISE(ABORT, 'lineup observations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS ingestion_runs_append_only_update BEFORE UPDATE ON ingestion_runs BEGIN SELECT RAISE(ABORT, 'ingestion runs are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS ingestion_runs_append_only_delete BEFORE DELETE ON ingestion_runs BEGIN SELECT RAISE(ABORT, 'ingestion runs are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS raw_provider_payloads_append_only_update BEFORE UPDATE ON raw_provider_payloads BEGIN SELECT RAISE(ABORT, 'raw provider payloads are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS raw_provider_payloads_append_only_delete BEFORE DELETE ON raw_provider_payloads BEGIN SELECT RAISE(ABORT, 'raw provider payloads are append-only'); END;
 """
 
 TRIGGER_NAMES = (
@@ -253,6 +273,8 @@ TRIGGER_NAMES = (
     "team_metric_observations_append_only_update", "team_metric_observations_append_only_delete",
     "player_availability_observations_append_only_update", "player_availability_observations_append_only_delete",
     "lineup_observations_append_only_update", "lineup_observations_append_only_delete",
+    "ingestion_runs_append_only_update", "ingestion_runs_append_only_delete",
+    "raw_provider_payloads_append_only_update", "raw_provider_payloads_append_only_delete",
 )
 
 def utc_now() -> str:
@@ -313,16 +335,16 @@ class Database:
             # migration must make that transition explicitly, with a backup.
             if not tables:
                 connection.executescript(SCHEMA)
-                connection.execute("INSERT INTO schema_version(version) VALUES (4)")
+                connection.execute("INSERT INTO schema_version(version) VALUES (5)")
                 return
             if "schema_version" not in tables:
                 return
             versions = [row[0] for row in connection.execute("SELECT version FROM schema_version")]
-            if versions == [3]:
+            if versions in ([3], [4]):
                 connection.executescript(SCHEMA)
-                connection.execute("UPDATE schema_version SET version = 4")
+                connection.execute("UPDATE schema_version SET version = 5")
                 return
-            if versions != [4]:
+            if versions != [5]:
                 return
             # A current-version database may receive repaired trigger bodies,
             # but initialization never rewrites its declared schema version.

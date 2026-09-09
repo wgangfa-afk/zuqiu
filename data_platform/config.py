@@ -19,6 +19,8 @@ class Settings:
     odds_provider: str | None = None
     fixture_provider: str | None = None
     results_provider: str | None = None
+    odds_min_remaining_credits: int = 0
+    odds_regions: str | None = None
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -29,6 +31,8 @@ class Settings:
             odds_provider=os.getenv("ODDS_PROVIDER") or None,
             fixture_provider=os.getenv("FIXTURE_PROVIDER") or None,
             results_provider=os.getenv("RESULTS_PROVIDER") or None,
+            odds_min_remaining_credits=int(os.getenv("THE_ODDS_MIN_REMAINING_CREDITS", "0")),
+            odds_regions=os.getenv("THE_ODDS_REGIONS") or None,
         )
 
     def sqlite_path(self) -> str:

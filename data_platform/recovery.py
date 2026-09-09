@@ -16,9 +16,9 @@ from .database import Database
 from .domain import SettlementOutcome
 from .settlement import pnl_for
 
-CURRENT_SCHEMA_VERSION = 4
-APPLICATION_VERSION = "FQ-V6-004"
-P0_TABLES = ("fixtures", "market_snapshots", "analysis_decisions", "executions", "settlements", "review_records", "bankroll_ledger", "audit_logs", "schema_version", "system_state", "fixture_context_observations", "team_metric_observations", "player_availability_observations", "lineup_observations")
+CURRENT_SCHEMA_VERSION = 5
+APPLICATION_VERSION = "FQ-V6-005"
+P0_TABLES = ("fixtures", "market_snapshots", "analysis_decisions", "executions", "settlements", "review_records", "bankroll_ledger", "audit_logs", "schema_version", "system_state", "fixture_context_observations", "team_metric_observations", "player_availability_observations", "lineup_observations", "ingestion_runs", "raw_provider_payloads", "ingested_snapshot_keys")
 DIGEST_TABLES = P0_TABLES
 REQUIRED_MANIFEST_FIELDS = {
     "backup_id", "database_path", "schema_version", "database_sha256",
