@@ -57,3 +57,55 @@ B 是工程与研究基础设施层，负责：
 - B / Codex Guide: V1.0
 
 开发前请先阅读 `docs/` 与 `codex_guide/`。`codex_guide/` 从现在起统一视为 B 分区的内部开发规范，不再使用 C 分区称谓。
+
+## Alpha Foundation（FQ-V6-001）
+
+本仓库的 Alpha Foundation 位于 `data_platform/`，只提供 B 分区的 SQLite、结算、三账隔离与模拟账本能力；不采集真实盘口，也不生成预测概率。
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+python -m data_platform health
+pytest
+```
+
+默认数据库是当前目录的 `football_quant.sqlite3`。也可通过 `.env` 设定 `DATABASE_URL=sqlite:///path/to/file.sqlite3`。所有内部时间字段使用 UTC；`TIMEZONE` 仅用于展示层的默认时区。
+
+## Recoverability（FQ-V6-002）
+
+`data_platform.recovery` 提供 SQLite 一致性备份、manifest SHA-256 校验、向全新路径恢复、启动完整性检查与资金账本重建。备份必须放在 Git 仓库外：
+
+```python
+from pathlib import Path
+from data_platform.database import Database
+from data_platform.recovery import create_backup, restore_backup, startup_integrity_check
+
+db = Database("football_quant.sqlite3")
+db.initialize()
+assert startup_integrity_check(db).ok
+manifest = create_backup(db, Path("../backup/manual"))
+restored = restore_backup(manifest, Path("../recovery-test.sqlite3"))
+```
+
+也可直接使用命令行完成真实备份与恢复演练（恢复目标必须是尚不存在的新文件）：
+
+```powershell
+python -m data_platform backup --destination ..\backup\manual
+python -m data_platform restore --manifest ..\backup\manual\<backup-id>.manifest.json --destination ..\recovery-test.sqlite3
+python -m data_platform health
+```
+
+manifest 会保存全部 P0 表的逐表摘要及正式 `stake/ROI/PnL` 基线。恢复过程先在临时数据库完成 checksum、row count、逐表 digest、账本重建、三账边界和 ROI/PnL 校验，通过后才原子发布到新路径；失败时不会覆盖既有目标。
+
+任何完整性失败都会使当前 `Database` 进入 `RECOVERY_REQUIRED`，阻止正式 Execution、锁单、结算和盘口快照写入；必须恢复到新数据库并重新通过检查后才可恢复运行。
+
+### 资金账本语义
+
+正式资金池采用**净 PnL 模型**。锁单时 `stake` ledger 记录的是不可变的风险暴露与周转额，数值为 `-stake_u`，但它**不计入** bankroll balance；结算时才以 `pnl_for()` 的净盈亏改变余额。因而，100U 资金池的一笔 1U @1.90 胜单结算后余额为 100.90U，而不是 99.90U。`rebuild_bankroll()` 返回余额、已实现 PnL、周转额、ROI 与逐 Execution 的核对结果。
+
+### Backup 完整性与限制
+
+一个备份只有同时具备匹配的 `.sqlite3` 与 manifest、完整必需元数据、受支持 schema 和匹配 SHA-256 时，才被标记为 `VALID`。缺少任一文件或存在 `.tmp` 发布残留为 `INCOMPLETE`；格式、版本或校验失败为 `INVALID`。可使用 `list_backups()` 清点，或用 `find_latest_valid_backup()` 选择最新可信备份；清点不会自动删除孤儿数据库或临时文件。
+
+SHA-256 与关键表 canonical digest 用于发现意外损坏、未完成发布及备份文件不一致；它们**不提供真实性保证**，也不能防御能同时重写数据库与 manifest 的攻击者。manifest 预留 `manifest_version`、`signature`、`hmac` 字段，签名/HMAC 属于未来阶段。
