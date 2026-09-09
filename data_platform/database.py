@@ -114,6 +114,37 @@ CREATE TABLE IF NOT EXISTS bankroll_ledger (
     created_at_utc TEXT NOT NULL,
     UNIQUE(execution_id, entry_type)
 );
+CREATE TABLE IF NOT EXISTS fixture_context_observations (
+    id TEXT PRIMARY KEY, fixture_id TEXT NOT NULL REFERENCES fixtures(id), competition_name TEXT,
+    country_code TEXT, season TEXT, competition_round TEXT, venue_name TEXT, neutral_venue INTEGER,
+    referee_name TEXT, provider TEXT NOT NULL, source_reference TEXT NOT NULL,
+    observed_at_utc TEXT NOT NULL, validation_status TEXT NOT NULL, raw_payload_hash TEXT NOT NULL,
+    mapping_version TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS team_metric_observations (
+    id TEXT PRIMARY KEY, fixture_id TEXT NOT NULL REFERENCES fixtures(id),
+    team_side TEXT NOT NULL CHECK(team_side IN ('HOME', 'AWAY')), metric_name TEXT NOT NULL,
+    metric_value REAL NOT NULL, unit TEXT, period_start_utc TEXT, period_end_utc TEXT,
+    sample_size INTEGER, provider TEXT NOT NULL, source_reference TEXT NOT NULL,
+    observed_at_utc TEXT NOT NULL, validation_status TEXT NOT NULL, raw_payload_hash TEXT NOT NULL,
+    mapping_version TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS player_availability_observations (
+    id TEXT PRIMARY KEY, fixture_id TEXT NOT NULL REFERENCES fixtures(id),
+    team_side TEXT NOT NULL CHECK(team_side IN ('HOME', 'AWAY')), player_reference TEXT,
+    player_name TEXT, availability_status TEXT NOT NULL, reported_reason TEXT,
+    source_confidence REAL, provider TEXT NOT NULL, source_reference TEXT NOT NULL,
+    observed_at_utc TEXT NOT NULL, validation_status TEXT NOT NULL, raw_payload_hash TEXT NOT NULL,
+    mapping_version TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS lineup_observations (
+    id TEXT PRIMARY KEY, fixture_id TEXT NOT NULL REFERENCES fixtures(id),
+    team_side TEXT NOT NULL CHECK(team_side IN ('HOME', 'AWAY')), player_reference TEXT,
+    player_name TEXT, lineup_status TEXT NOT NULL CHECK(lineup_status IN ('STARTER', 'BENCH', 'OUT', 'UNKNOWN')),
+    position TEXT, shirt_number INTEGER, provider TEXT NOT NULL, source_reference TEXT NOT NULL,
+    observed_at_utc TEXT NOT NULL, validation_status TEXT NOT NULL, raw_payload_hash TEXT NOT NULL,
+    mapping_version TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE
+);
 CREATE TRIGGER IF NOT EXISTS market_snapshots_are_append_only_update
 BEFORE UPDATE ON market_snapshots
 BEGIN SELECT RAISE(ABORT, 'market snapshots are append-only'); END;
@@ -166,6 +197,14 @@ BEGIN SELECT RAISE(ABORT, 'bankroll ledger is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS bankroll_ledger_is_append_only_delete
 BEFORE DELETE ON bankroll_ledger
 BEGIN SELECT RAISE(ABORT, 'bankroll ledger is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS fixture_context_observations_append_only_update BEFORE UPDATE ON fixture_context_observations BEGIN SELECT RAISE(ABORT, 'fixture context observations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS fixture_context_observations_append_only_delete BEFORE DELETE ON fixture_context_observations BEGIN SELECT RAISE(ABORT, 'fixture context observations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS team_metric_observations_append_only_update BEFORE UPDATE ON team_metric_observations BEGIN SELECT RAISE(ABORT, 'team metric observations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS team_metric_observations_append_only_delete BEFORE DELETE ON team_metric_observations BEGIN SELECT RAISE(ABORT, 'team metric observations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS player_availability_observations_append_only_update BEFORE UPDATE ON player_availability_observations BEGIN SELECT RAISE(ABORT, 'player availability observations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS player_availability_observations_append_only_delete BEFORE DELETE ON player_availability_observations BEGIN SELECT RAISE(ABORT, 'player availability observations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS lineup_observations_append_only_update BEFORE UPDATE ON lineup_observations BEGIN SELECT RAISE(ABORT, 'lineup observations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS lineup_observations_append_only_delete BEFORE DELETE ON lineup_observations BEGIN SELECT RAISE(ABORT, 'lineup observations are append-only'); END;
 """
 
 TRIGGER_NAMES = (
@@ -180,6 +219,10 @@ TRIGGER_NAMES = (
     "settlements_are_append_only_delete",
     "bankroll_ledger_is_append_only_update",
     "bankroll_ledger_is_append_only_delete",
+    "fixture_context_observations_append_only_update", "fixture_context_observations_append_only_delete",
+    "team_metric_observations_append_only_update", "team_metric_observations_append_only_delete",
+    "player_availability_observations_append_only_update", "player_availability_observations_append_only_delete",
+    "lineup_observations_append_only_update", "lineup_observations_append_only_delete",
 )
 
 def utc_now() -> str:
@@ -240,18 +283,101 @@ class Database:
             # migration must make that transition explicitly, with a backup.
             if not tables:
                 connection.executescript(SCHEMA)
-                connection.execute("INSERT INTO schema_version(version) VALUES (3)")
+                connection.execute("INSERT INTO schema_version(version) VALUES (4)")
                 return
             if "schema_version" not in tables:
                 return
             versions = [row[0] for row in connection.execute("SELECT version FROM schema_version")]
-            if versions != [3]:
+            if versions == [3]:
+                connection.executescript(SCHEMA)
+                connection.execute("UPDATE schema_version SET version = 4")
+                return
+            if versions != [4]:
                 return
             # A current-version database may receive repaired trigger bodies,
             # but initialization never rewrites its declared schema version.
             for trigger in TRIGGER_NAMES:
                 connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             connection.executescript(SCHEMA)
+
+    @staticmethod
+    def _evidence_text(value: object, name: str, *, allow_none: bool = False) -> str | None:
+        if value is None and allow_none:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a non-empty string")
+        return value
+
+    @staticmethod
+    def _evidence_number(value: object, name: str, *, integer: bool = False, allow_none: bool = False) -> float | int | None:
+        import math
+        if value is None and allow_none:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{name} must be a finite number")
+        if integer and int(value) != value:
+            raise ValueError(f"{name} must be an integer")
+        return int(value) if integer else float(value)
+
+    def _append_evidence(self, table: str, fields: dict[str, object]) -> str:
+        self._assert_writable()
+        for key in ("provider", "source_reference", "raw_payload_hash", "mapping_version", "validation_status"):
+            self._evidence_text(fields.get(key), key)
+        fields["observed_at_utc"] = normalize_utc(str(fields["observed_at_utc"]))
+        columns = tuple(fields)
+        placeholders = ", ".join(f":{column}" for column in columns)
+        observation_id = str(uuid4())
+        try:
+            with self.connection() as connection:
+                connection.execute(
+                    f"INSERT INTO {table} (id, {', '.join(columns)}) VALUES (:id, {placeholders})",
+                    {"id": observation_id, **fields},
+                )
+        except sqlite3.IntegrityError as error:
+            if "idempotency_key" in str(error):
+                with self.connection() as connection:
+                    row = connection.execute(f"SELECT id FROM {table} WHERE idempotency_key = ?", (fields["idempotency_key"],)).fetchone()
+                if row is not None:
+                    return str(row["id"])
+            raise
+        return observation_id
+
+    def append_fixture_context(self, **fields: object) -> str:
+        fields.setdefault("idempotency_key", f"context:{fields.get('provider')}:{fields.get('raw_payload_hash')}")
+        if fields.get("neutral_venue") not in (None, True, False):
+            raise ValueError("neutral_venue must be bool or None")
+        if fields.get("neutral_venue") is not None:
+            fields["neutral_venue"] = int(bool(fields["neutral_venue"]))
+        return self._append_evidence("fixture_context_observations", fields)
+
+    def append_team_metric(self, **fields: object) -> str:
+        if fields.get("team_side") not in ("HOME", "AWAY"):
+            raise ValueError("team_side must be HOME or AWAY")
+        fields["metric_name"] = self._evidence_text(fields.get("metric_name"), "metric_name")
+        fields["metric_value"] = self._evidence_number(fields.get("metric_value"), "metric_value")
+        fields["sample_size"] = self._evidence_number(fields.get("sample_size"), "sample_size", integer=True, allow_none=True)
+        for key in ("period_start_utc", "period_end_utc"):
+            if fields.get(key) is not None:
+                fields[key] = normalize_utc(str(fields[key]))
+        fields.setdefault("idempotency_key", f"metric:{fields.get('provider')}:{fields.get('raw_payload_hash')}:{fields.get('team_side')}:{fields.get('metric_name')}")
+        return self._append_evidence("team_metric_observations", fields)
+
+    def append_player_availability(self, **fields: object) -> str:
+        if fields.get("team_side") not in ("HOME", "AWAY"):
+            raise ValueError("team_side must be HOME or AWAY")
+        fields["availability_status"] = self._evidence_text(fields.get("availability_status"), "availability_status")
+        fields["source_confidence"] = self._evidence_number(fields.get("source_confidence"), "source_confidence", allow_none=True)
+        fields.setdefault("idempotency_key", f"availability:{fields.get('provider')}:{fields.get('raw_payload_hash')}:{fields.get('team_side')}:{fields.get('player_reference')}")
+        return self._append_evidence("player_availability_observations", fields)
+
+    def append_lineup(self, **fields: object) -> str:
+        if fields.get("team_side") not in ("HOME", "AWAY"):
+            raise ValueError("team_side must be HOME or AWAY")
+        if fields.get("lineup_status") not in ("STARTER", "BENCH", "OUT", "UNKNOWN"):
+            raise ValueError("invalid lineup_status")
+        fields["shirt_number"] = self._evidence_number(fields.get("shirt_number"), "shirt_number", integer=True, allow_none=True)
+        fields.setdefault("idempotency_key", f"lineup:{fields.get('provider')}:{fields.get('raw_payload_hash')}:{fields.get('team_side')}:{fields.get('player_reference')}")
+        return self._append_evidence("lineup_observations", fields)
 
     def record_audit(self, event_type: str, *, entity_type: str | None = None, entity_id: str | None = None, payload_json: str = "{}") -> None:
         with self.connection() as connection:

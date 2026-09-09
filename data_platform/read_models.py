@@ -82,3 +82,43 @@ class SettlementRecord:
     settled_at_utc: datetime
     pnl_u: float
     clv: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class FixtureContextRecord:
+    id: str
+    fixture_id: str
+    competition_name: str | None
+    country_code: str | None
+    season: str | None
+    competition_round: str | None
+    venue_name: str | None
+    neutral_venue: bool | None
+    referee_name: str | None
+    provider: str
+    source_reference: str
+    observed_at_utc: datetime
+    validation_status: str
+    raw_payload_hash: str
+    mapping_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class TeamMetricRecord:
+    id: str; fixture_id: str; team_side: str; metric_name: str; metric_value: float
+    unit: str | None; period_start_utc: datetime | None; period_end_utc: datetime | None; sample_size: int | None
+    provider: str; source_reference: str; observed_at_utc: datetime; validation_status: str; raw_payload_hash: str; mapping_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlayerAvailabilityRecord:
+    id: str; fixture_id: str; team_side: str; player_reference: str | None; player_name: str | None
+    availability_status: str; reported_reason: str | None; source_confidence: float | None
+    provider: str; source_reference: str; observed_at_utc: datetime; validation_status: str; raw_payload_hash: str; mapping_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class LineupRecord:
+    id: str; fixture_id: str; team_side: str; player_reference: str | None; player_name: str | None
+    lineup_status: str; position: str | None; shirt_number: int | None
+    provider: str; source_reference: str; observed_at_utc: datetime; validation_status: str; raw_payload_hash: str; mapping_version: str
