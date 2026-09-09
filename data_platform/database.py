@@ -175,6 +175,13 @@ CREATE TABLE IF NOT EXISTS lineup_observations (
     observed_at_utc TEXT NOT NULL, validation_status TEXT NOT NULL, raw_payload_hash TEXT NOT NULL,
     mapping_version TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE
 );
+CREATE TABLE IF NOT EXISTS source_documents (
+    id TEXT PRIMARY KEY, source_type TEXT NOT NULL CHECK(source_type IN ('PUBLIC_HTML','PUBLIC_TEXT','JSON_LD','CSV_IMPORT','JSON_IMPORT','MANUAL_VERIFIED')),
+    source_url TEXT NOT NULL, source_domain TEXT NOT NULL, retrieved_at_utc TEXT NOT NULL, published_at_utc TEXT,
+    content_type TEXT NOT NULL, document_title TEXT, content_text TEXT NOT NULL, content_sha256 TEXT NOT NULL,
+    parser_name TEXT, parser_version TEXT, validation_status TEXT NOT NULL, retrieval_method TEXT NOT NULL CHECK(retrieval_method IN ('WEB_FETCH','BROWSER_CAPTURE','FILE_IMPORT','MANUAL_ENTRY')),
+    parent_document_id TEXT REFERENCES source_documents(id), idempotency_key TEXT NOT NULL UNIQUE
+);
 CREATE TRIGGER IF NOT EXISTS market_snapshots_are_append_only_update
 BEFORE UPDATE ON market_snapshots
 BEGIN SELECT RAISE(ABORT, 'market snapshots are append-only'); END;
@@ -235,6 +242,8 @@ CREATE TRIGGER IF NOT EXISTS player_availability_observations_append_only_update
 CREATE TRIGGER IF NOT EXISTS player_availability_observations_append_only_delete BEFORE DELETE ON player_availability_observations BEGIN SELECT RAISE(ABORT, 'player availability observations are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS lineup_observations_append_only_update BEFORE UPDATE ON lineup_observations BEGIN SELECT RAISE(ABORT, 'lineup observations are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS lineup_observations_append_only_delete BEFORE DELETE ON lineup_observations BEGIN SELECT RAISE(ABORT, 'lineup observations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS source_documents_append_only_update BEFORE UPDATE ON source_documents BEGIN SELECT RAISE(ABORT, 'source documents are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS source_documents_append_only_delete BEFORE DELETE ON source_documents BEGIN SELECT RAISE(ABORT, 'source documents are append-only'); END;
 """
 
 TRIGGER_NAMES = (
@@ -253,6 +262,7 @@ TRIGGER_NAMES = (
     "team_metric_observations_append_only_update", "team_metric_observations_append_only_delete",
     "player_availability_observations_append_only_update", "player_availability_observations_append_only_delete",
     "lineup_observations_append_only_update", "lineup_observations_append_only_delete",
+    "source_documents_append_only_update", "source_documents_append_only_delete",
 )
 
 def utc_now() -> str:
@@ -313,16 +323,16 @@ class Database:
             # migration must make that transition explicitly, with a backup.
             if not tables:
                 connection.executescript(SCHEMA)
-                connection.execute("INSERT INTO schema_version(version) VALUES (4)")
+                connection.execute("INSERT INTO schema_version(version) VALUES (5)")
                 return
             if "schema_version" not in tables:
                 return
             versions = [row[0] for row in connection.execute("SELECT version FROM schema_version")]
-            if versions == [3]:
+            if versions in ([3], [4]):
                 connection.executescript(SCHEMA)
-                connection.execute("UPDATE schema_version SET version = 4")
+                connection.execute("UPDATE schema_version SET version = 5")
                 return
-            if versions != [4]:
+            if versions != [5]:
                 return
             # A current-version database may receive repaired trigger bodies,
             # but initialization never rewrites its declared schema version.
