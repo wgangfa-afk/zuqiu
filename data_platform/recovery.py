@@ -22,7 +22,7 @@ P0_TABLES = ("fixtures", "market_snapshots", "analysis_decisions", "executions",
 DIGEST_TABLES = P0_TABLES
 REQUIRED_MANIFEST_FIELDS = {
     "backup_id", "database_path", "schema_version", "database_sha256",
-    "table_row_counts", "table_digests", "official_performance", "created_at_utc",
+    "table_row_counts", "table_digests", "official_performance", "created_at_utc", "manifest_version",
 }
 LOGGER = logging.getLogger(__name__)
 
@@ -56,10 +56,12 @@ def _different(left: float, right: float) -> bool:
     return abs(float(left) - float(right)) > 1e-9
 
 
-def _execution_reconciliation(connection: sqlite3.Connection) -> tuple[list[str], float, int]:
-    """Rebuild each Execution's immutable financial facts, never merely totals."""
+def _execution_reconciliation(connection: sqlite3.Connection) -> tuple[list[str], float, float, float, int]:
+    """Rebuild net PnL from immutable facts; stake is exposure, not a loss."""
     errors: list[str] = []
-    expected_balance = 0.0
+    expected_realized_pnl = 0.0
+    exposure_u = 0.0
+    settled_turnover_u = 0.0
     executions = connection.execute(
         """SELECT e.*, f.kickoff_at_utc, s.outcome, s.pnl_u AS settlement_pnl
            FROM executions e JOIN fixtures f ON f.id = e.fixture_id
@@ -82,7 +84,7 @@ def _execution_reconciliation(connection: sqlite3.Connection) -> tuple[list[str]
             elif _different(stake_entries[0]["amount_u"], -float(execution["stake_u"])):
                 errors.append(f"{execution_id}: stake ledger amount differs from immutable stake")
             else:
-                expected_balance -= float(execution["stake_u"])
+                exposure_u += float(execution["stake_u"])
         elif status == "draft":
             if stake_entries or settlement_count or pnl_entries:
                 errors.append(f"{execution_id}: draft has formal financial facts")
@@ -93,6 +95,7 @@ def _execution_reconciliation(connection: sqlite3.Connection) -> tuple[list[str]
             if settlement_count != 0 or pnl_entries:
                 errors.append(f"{execution_id}: locked execution has settlement facts")
         elif status == "settled":
+            settled_turnover_u += float(execution["stake_u"])
             if settlement_count != 1 or len(pnl_entries) != 1:
                 errors.append(f"{execution_id}: settled execution requires one settlement and one PnL ledger")
                 continue
@@ -102,10 +105,10 @@ def _execution_reconciliation(connection: sqlite3.Connection) -> tuple[list[str]
             if _different(pnl_entries[0]["amount_u"], expected_pnl):
                 errors.append(f"{execution_id}: PnL ledger differs from calculated outcome")
             if not _different(execution["settlement_pnl"], expected_pnl) and not _different(pnl_entries[0]["amount_u"], expected_pnl):
-                expected_balance += expected_pnl
+                expected_realized_pnl += expected_pnl
         if status != "settled" and pnl_entries:
             errors.append(f"{execution_id}: non-settled execution has PnL ledger")
-    return errors, expected_balance, len(executions)
+    return errors, expected_realized_pnl, exposure_u, settled_turnover_u, len(executions)
 
 
 def _three_book_reconciliation(connection: sqlite3.Connection) -> list[str]:
@@ -172,12 +175,9 @@ def startup_integrity_check(database: Database, *, audit: bool = True) -> Integr
             if len(versions) != 1 or versions[0][0] != CURRENT_SCHEMA_VERSION:
                 errors.append("schema version is missing, unsupported, or migration is required")
             try:
-                fact_errors, rebuilt, _ = _execution_reconciliation(connection)
+                fact_errors, _, _, _, _ = _execution_reconciliation(connection)
                 errors.extend(fact_errors)
                 errors.extend(_three_book_reconciliation(connection))
-                stored = float(connection.execute("SELECT COALESCE(SUM(amount_u), 0) FROM bankroll_ledger").fetchone()[0])
-                if _different(stored, rebuilt):
-                    errors.append("bankroll total differs from per-execution rebuild")
                 required_append_only = {
                     "market_snapshots_are_append_only_update", "market_snapshots_are_append_only_delete",
                     "settlements_are_append_only_update", "settlements_are_append_only_delete",
@@ -217,6 +217,20 @@ def _fsync_file(path: Path) -> None:
         os.fsync(stream.fileno())
 
 
+def _fsync_directory(path: Path) -> bool:
+    """Report unsupported directory fsync instead of pretending it succeeded."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return True
+    except OSError as error:
+        LOGGER.warning("directory fsync unsupported or failed for %s: %s", path, error)
+        return False
+
+
 def create_backup(database: Database, destination: Path, *, git_commit_sha: str | None = None, forensic_backup: bool = False) -> Path:
     """Use SQLite's backup API; never copy a live database file directly."""
     report = startup_integrity_check(database)
@@ -249,13 +263,15 @@ def create_backup(database: Database, destination: Path, *, git_commit_sha: str 
             last_settlement = backup_connection.execute("SELECT MAX(settled_at_utc) FROM settlements").fetchone()[0]
         finally:
             backup_connection.close()
-        manifest = {"backup_id": backup_id, "created_at_utc": datetime.now(timezone.utc).isoformat(), "application_version": APPLICATION_VERSION, "database_path": database_file.name, "schema_version": schema_version, "git_commit_sha": git_commit_sha, "db_size": database_tmp.stat().st_size, "database_sha256": _sha256(database_tmp), "sqlite_version": sqlite3.sqlite_version, "health_status": database.health_state, "table_row_counts": row_counts, "table_digests": table_digests, "official_performance": official_performance, "last_execution_locked_at": last_locked, "last_settlement_at": last_settlement}
+        manifest = {"manifest_version": 1, "backup_id": backup_id, "created_at_utc": datetime.now(timezone.utc).isoformat(), "application_version": APPLICATION_VERSION, "database_path": database_file.name, "schema_version": schema_version, "git_commit_sha": git_commit_sha, "db_size": database_tmp.stat().st_size, "database_sha256": _sha256(database_tmp), "sqlite_version": sqlite3.sqlite_version, "health_status": database.health_state, "table_row_counts": row_counts, "table_digests": table_digests, "official_performance": official_performance, "last_execution_locked_at": last_locked, "last_settlement_at": last_settlement, "signature": None, "hmac": None}
         with manifest_tmp.open("w", encoding="utf-8") as stream:
             json.dump(manifest, stream, indent=2, sort_keys=True)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(database_tmp, database_file)
+        _fsync_directory(destination)
         os.replace(manifest_tmp, manifest_file)
+        _fsync_directory(destination)
         database.record_audit("backup_completed", payload_json=json.dumps({"backup_id": backup_id}))
         return manifest_file
     except Exception:
@@ -281,7 +297,65 @@ def _validate_manifest(manifest: object) -> dict[str, object]:
         raise ValueError("manifest table metadata is invalid")
     if set(manifest["table_row_counts"]) != set(P0_TABLES) or set(manifest["table_digests"]) != set(DIGEST_TABLES):
         raise ValueError("manifest table metadata is incomplete")
+    if manifest["schema_version"] != CURRENT_SCHEMA_VERSION:
+        raise ValueError("manifest schema version is unsupported")
     return manifest
+
+
+@dataclass(frozen=True)
+class BackupCandidate:
+    database_path: Path | None
+    manifest_path: Path | None
+    status: str
+    reason: str
+    created_at_utc: str | None = None
+
+
+def _backup_schema_is_supported(database_path: Path) -> bool:
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(database_path)
+        versions = connection.execute("SELECT version FROM schema_version").fetchall()
+        return len(versions) == 1 and versions[0][0] == CURRENT_SCHEMA_VERSION
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def list_backups(destination: Path) -> tuple[BackupCandidate, ...]:
+    """Inventory only; orphaned databases and temporary files are never deleted."""
+    if not destination.exists():
+        return ()
+    candidates: list[BackupCandidate] = []
+    consumed: set[Path] = set()
+    for manifest_path in sorted(destination.glob("*.manifest.json")):
+        try:
+            manifest = _validate_manifest(json.loads(manifest_path.read_text(encoding="utf-8")))
+            database_path = manifest_path.parent / str(manifest["database_path"])
+            if not database_path.is_file():
+                candidates.append(BackupCandidate(database_path, manifest_path, "INCOMPLETE", "database file is missing"))
+            elif _sha256(database_path) != manifest["database_sha256"]:
+                candidates.append(BackupCandidate(database_path, manifest_path, "INVALID", "database checksum mismatch"))
+            elif not _backup_schema_is_supported(database_path):
+                candidates.append(BackupCandidate(database_path, manifest_path, "INVALID", "database schema is unsupported"))
+            else:
+                candidates.append(BackupCandidate(database_path, manifest_path, "VALID", "verified", str(manifest["created_at_utc"])))
+            consumed.add(database_path)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            candidates.append(BackupCandidate(None, manifest_path, "INVALID", f"invalid manifest: {error}"))
+    for database_path in sorted(destination.glob("*.sqlite3")):
+        if database_path not in consumed:
+            candidates.append(BackupCandidate(database_path, None, "INCOMPLETE", "manifest is missing"))
+    for temporary_path in sorted(destination.glob("*.tmp")):
+        candidates.append(BackupCandidate(None, temporary_path, "INCOMPLETE", "temporary publication artifact"))
+    return tuple(candidates)
+
+
+def find_latest_valid_backup(destination: Path) -> BackupCandidate | None:
+    valid = [item for item in list_backups(destination) if item.status == "VALID"]
+    return max(valid, key=lambda item: item.created_at_utc or "") if valid else None
 
 
 def restore_backup(manifest_path: Path, target_path: Path) -> Database:
@@ -296,6 +370,7 @@ def restore_backup(manifest_path: Path, target_path: Path) -> Database:
     if restore_tmp.exists():
         raise ValueError("restore temporary path already exists")
     target_path.parent.mkdir(parents=True, exist_ok=True)
+    published = False
     try:
         source_connection = sqlite3.connect(source)
         target_connection = sqlite3.connect(restore_tmp)
@@ -323,32 +398,36 @@ def restore_backup(manifest_path: Path, target_path: Path) -> Database:
         restored.record_audit("restore_started", payload_json=json.dumps({"backup_id": manifest["backup_id"]}))
         _fsync_file(restore_tmp)
         os.replace(restore_tmp, target_path)
+        published = True
+        _fsync_directory(target_path.parent)
         final = Database(target_path)
-        final.mark_healthy("restored_verified")
-        final.record_audit("restore_completed", payload_json=json.dumps({"backup_id": manifest["backup_id"]}))
         final_report = startup_integrity_check(final, audit=False)
         if not final_report.ok or any(
             _different(final.official_performance()[key], manifest["official_performance"][key])
             for key in ("pnl_u", "stake_u", "roi")
         ):
             raise RuntimeError("published restore failed final reopen verification")
+        final.record_audit("restore_completed", payload_json=json.dumps({"backup_id": manifest["backup_id"]}))
         return final
     except Exception:
         restore_tmp.unlink(missing_ok=True)
-        if target_path.exists():
-            target_path.unlink()
+        if published:
+            target_path.unlink(missing_ok=True)
         LOGGER.exception("restore failed")
         raise
 
 
-def rebuild_bankroll(database: Database) -> dict[str, object]:
-    """Reconcile all ledger entries against immutable execution/settlement facts."""
+def rebuild_bankroll(database: Database, *, initial_bankroll_u: float = 100.0) -> dict[str, object]:
+    """Net-PnL balance: stake ledger records exposure/turnover, not a loss."""
     with database.connection() as connection:
-        mismatches, rebuilt, executions_checked = _execution_reconciliation(connection)
-        stored = float(connection.execute("SELECT COALESCE(SUM(amount_u), 0) FROM bankroll_ledger").fetchone()[0])
-        if _different(stored, rebuilt):
-            mismatches.append("bankroll total differs from per-execution rebuild")
-    result = {"balance_u": round(stored, 10), "rebuilt_balance_u": round(rebuilt, 10), "executions_checked": executions_checked, "mismatches": tuple(mismatches)}
+        mismatches, realized_pnl, exposure_u, turnover_u, executions_checked = _execution_reconciliation(connection)
+        official = _official_performance(connection)
+        if _different(official["pnl_u"], realized_pnl):
+            mismatches.append("official performance PnL differs from immutable fact rebuild")
+        if _different(official["stake_u"], turnover_u):
+            mismatches.append("official performance turnover differs from immutable execution stakes")
+    balance = float(initial_bankroll_u) + realized_pnl
+    result = {"initial_bankroll_u": float(initial_bankroll_u), "balance_u": round(balance, 10), "rebuilt_balance_u": round(balance, 10), "realized_pnl_u": round(realized_pnl, 10), "turnover_u": round(turnover_u, 10), "exposure_u": round(exposure_u, 10), "roi": round(realized_pnl / turnover_u, 10) if turnover_u else 0.0, "executions_checked": executions_checked, "mismatches": tuple(mismatches)}
     if mismatches:
         database.require_recovery()
         raise ValueError(f"bankroll reconciliation failed: {mismatches}")

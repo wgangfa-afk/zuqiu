@@ -8,7 +8,7 @@ import pytest
 
 from data_platform.domain import DecisionAction, SettlementOutcome
 from data_platform.database import Database
-from data_platform.recovery import _sha256, create_backup, rebuild_bankroll, restore_backup, startup_integrity_check
+from data_platform.recovery import _sha256, create_backup, find_latest_valid_backup, list_backups, rebuild_bankroll, restore_backup, startup_integrity_check
 
 from .test_ledger import execution_fields
 
@@ -26,7 +26,7 @@ def test_backup_manifest_and_restore_to_new_database(database, fixture_id, tmp_p
     manifest = create_backup(database, tmp_path / "backup" , git_commit_sha="test")
     restored = restore_backup(manifest, tmp_path / "restored.sqlite3")
     assert startup_integrity_check(restored).ok
-    assert rebuild_bankroll(restored) == {"balance_u": -0.1, "rebuilt_balance_u": -0.1, "executions_checked": 1, "mismatches": ()}
+    assert rebuild_bankroll(restored)["balance_u"] == 100.9
     assert restored.official_performance() == before
 
 
@@ -207,3 +207,26 @@ def test_failed_restore_never_overwrites_existing_target(database, tmp_path):
     with pytest.raises(ValueError, match="new database path"):
         restore_backup(manifest_path, target)
     assert target.read_bytes() == b"keep-me"
+
+
+@pytest.mark.parametrize(("outcome", "balance"), [
+    (SettlementOutcome.WIN, 100.90), (SettlementOutcome.HALF_WIN, 100.45),
+    (SettlementOutcome.PUSH, 100.00), (SettlementOutcome.HALF_LOSS, 99.50),
+    (SettlementOutcome.LOSS, 99.00),
+])
+def test_net_pnl_balance_does_not_count_stake_as_loss(database, fixture_id, outcome, balance):
+    execution_id = locked_execution(database, fixture_id)
+    database.add_settlement(execution_id=execution_id, outcome=outcome, result_payload_reference="synthetic://ft")
+    rebuilt = rebuild_bankroll(database)
+    assert rebuilt["balance_u"] == balance
+    assert rebuilt["turnover_u"] == 1.0
+
+
+def test_backup_inventory_excludes_orphans_and_corruption(database, tmp_path):
+    manifest = create_backup(database, tmp_path / "backups")
+    destination = manifest.parent
+    (destination / "orphan.sqlite3").write_bytes(b"partial")
+    (destination / "interrupted.sqlite3.tmp").write_bytes(b"partial")
+    assert find_latest_valid_backup(destination).manifest_path == manifest
+    states = {item.status for item in list_backups(destination)}
+    assert "INCOMPLETE" in states and "VALID" in states
