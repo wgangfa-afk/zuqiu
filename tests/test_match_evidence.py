@@ -73,8 +73,15 @@ def test_evidence_filters_future_boundary_and_backup_restore(database, fixture_i
         counts, digests = _rows(connection), _table_digests(connection)
         assert {key: counts[key] for key in evidence_tables} == {key: before[0][key] for key in evidence_tables}
         assert {key: digests[key] for key in evidence_tables} == {key: before[1][key] for key in evidence_tables}
-        with pytest.raises(Exception):
-            connection.execute("DELETE FROM lineup_observations")
+        for table in evidence_tables:
+            before_count = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            before_digest = _table_digests(connection)[table]
+            with pytest.raises(Exception):
+                connection.execute(f"UPDATE {table} SET provider = 'changed'")
+            with pytest.raises(Exception):
+                connection.execute(f"DELETE FROM {table}")
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == before_count
+            assert _table_digests(connection)[table] == before_digest
 
 
 @pytest.mark.parametrize("method, fields", [
@@ -143,3 +150,51 @@ def test_read_evidence_filter_boundaries_and_health(database, fixture_id, tmp_pa
     database.require_recovery()
     with pytest.raises(DatabaseNotHealthyError):
         ReadRepository(database)
+
+
+@pytest.mark.parametrize("method, old_fields, optional_field", [
+    ("append_fixture_context", {"competition_name": "League"}, "competition_name"),
+    ("append_team_metric", {"team_side": "HOME", "metric_name": "xg", "metric_value": 1.0, "unit": "goals"}, "unit"),
+    ("append_player_availability", {"team_side": "HOME", "player_name": "Player", "availability_status": "OUT", "reported_reason": "injury"}, "reported_reason"),
+    ("append_lineup", {"team_side": "HOME", "player_name": "Player", "lineup_status": "STARTER", "position": "FW"}, "position"),
+])
+def test_idempotency_compares_complete_normalized_field_set(database, fixture_id, method, old_fields, optional_field):
+    first = common(fixture_id, idempotency_key=f"complete-{method}", **old_fields)
+    record_id = getattr(database, method)(**first)
+    retry = dict(first)
+    retry.pop(optional_field)
+    with pytest.raises(IdempotencyConflictError):
+        getattr(database, method)(**retry)
+    assert getattr(database, method)(**first) == record_id
+    inverse = common(fixture_id, idempotency_key=f"inverse-{method}")
+    for required in ("team_side", "metric_name", "metric_value", "availability_status", "lineup_status", "player_name"):
+        if required in old_fields:
+            inverse[required] = old_fields[required]
+    inverse_id = getattr(database, method)(**inverse)
+    with pytest.raises(IdempotencyConflictError):
+        getattr(database, method)(**{**inverse, **old_fields})
+    assert inverse_id
+
+
+@pytest.mark.parametrize("method, fields", [
+    ("append_fixture_context", {"competition_name": "League"}),
+    ("append_team_metric", {"team_side": "HOME", "metric_name": "xg", "metric_value": 1.0}),
+    ("append_player_availability", {"team_side": "HOME", "player_name": "Player", "availability_status": "OUT"}),
+    ("append_lineup", {"team_side": "HOME", "player_name": "Player", "lineup_status": "STARTER"}),
+])
+def test_evidence_unknown_fields_are_rejected_without_insert(database, fixture_id, method, fields):
+    with pytest.raises(ValueError):
+        getattr(database, method)(**common(fixture_id, unexpected="no", **fields))
+    with database.connection() as connection:
+        table = {"append_fixture_context": "fixture_context_observations", "append_team_metric": "team_metric_observations", "append_player_availability": "player_availability_observations", "append_lineup": "lineup_observations"}[method]
+        assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
+def test_player_reference_is_default_identity_but_fields_remain_facts(database, fixture_id):
+    first = common(fixture_id, team_side="HOME", player_reference="p1", player_name="Old", lineup_status="STARTER")
+    record_id = database.append_lineup(**first)
+    # Reference fixes default identity; a changed persisted name conflicts with that identity.
+    with pytest.raises(IdempotencyConflictError):
+        database.append_lineup(**{**first, "player_name": "New"})
+    assert database.append_lineup(**first) == record_id
+    assert database.append_lineup(**common(fixture_id, team_side="HOME", player_name="Name A", lineup_status="STARTER", raw_payload_hash="same")) != database.append_lineup(**common(fixture_id, team_side="HOME", player_name="Name B", lineup_status="STARTER", raw_payload_hash="same"))

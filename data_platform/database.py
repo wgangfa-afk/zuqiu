@@ -19,6 +19,30 @@ class IdempotencyConflictError(ValueError):
     """Raised when an idempotency key is reused for different evidence facts."""
 
 
+EVIDENCE_FIELDS: dict[str, tuple[str, ...]] = {
+    "fixture_context_observations": (
+        "fixture_id", "competition_name", "country_code", "season", "competition_round",
+        "venue_name", "neutral_venue", "referee_name", "provider", "source_reference",
+        "observed_at_utc", "validation_status", "raw_payload_hash", "mapping_version", "idempotency_key",
+    ),
+    "team_metric_observations": (
+        "fixture_id", "team_side", "metric_name", "metric_value", "unit", "period_start_utc",
+        "period_end_utc", "sample_size", "provider", "source_reference", "observed_at_utc",
+        "validation_status", "raw_payload_hash", "mapping_version", "idempotency_key",
+    ),
+    "player_availability_observations": (
+        "fixture_id", "team_side", "player_reference", "player_name", "availability_status",
+        "reported_reason", "source_confidence", "provider", "source_reference", "observed_at_utc",
+        "validation_status", "raw_payload_hash", "mapping_version", "idempotency_key",
+    ),
+    "lineup_observations": (
+        "fixture_id", "team_side", "player_reference", "player_name", "lineup_status", "position",
+        "shirt_number", "provider", "source_reference", "observed_at_utc", "validation_status",
+        "raw_payload_hash", "mapping_version", "idempotency_key",
+    ),
+}
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
@@ -339,11 +363,16 @@ class Database:
 
     def _append_evidence(self, table: str, fields: dict[str, object]) -> str:
         self._assert_writable()
+        allowed = EVIDENCE_FIELDS[table]
+        unknown = set(fields).difference(allowed)
+        if unknown:
+            raise ValueError(f"unsupported evidence fields: {sorted(unknown)}")
+        fields = {field: fields.get(field) for field in allowed}
         for key in ("provider", "source_reference", "raw_payload_hash", "mapping_version", "validation_status"):
             self._evidence_text(fields.get(key), key)
         fields["observed_at_utc"] = normalize_utc(str(fields["observed_at_utc"]))
         fields["idempotency_key"] = self._validate_idempotency_key(fields.get("idempotency_key"))
-        columns = tuple(fields)
+        columns = allowed
         placeholders = ", ".join(f":{column}" for column in columns)
         observation_id = str(uuid4())
         try:
@@ -357,7 +386,8 @@ class Database:
                 with self.connection() as connection:
                     row = connection.execute(f"SELECT * FROM {table} WHERE idempotency_key = ?", (fields["idempotency_key"],)).fetchone()
                 if row is not None:
-                    for field, value in fields.items():
+                    for field in allowed:
+                        value = fields[field]
                         if row[field] != value:
                             raise IdempotencyConflictError(
                                 f"idempotency_key conflicts with existing {table} evidence"
@@ -367,18 +397,24 @@ class Database:
         return observation_id
 
     def append_fixture_context(self, **fields: object) -> str:
+        unknown = set(fields).difference(EVIDENCE_FIELDS["fixture_context_observations"])
+        if unknown:
+            raise ValueError(f"unsupported evidence fields: {sorted(unknown)}")
+        fields = {field: fields.get(field) for field in EVIDENCE_FIELDS["fixture_context_observations"]}
         fields["observed_at_utc"] = normalize_utc(str(fields["observed_at_utc"]))
         if fields.get("neutral_venue") not in (None, True, False):
             raise ValueError("neutral_venue must be bool or None")
         if fields.get("neutral_venue") is not None:
             fields["neutral_venue"] = int(bool(fields["neutral_venue"]))
-        fields.setdefault("idempotency_key", self._default_idempotency_key(
-            "fixture_context_observations", fields,
-            ("fixture_id", "provider", "raw_payload_hash", "mapping_version", "observed_at_utc"),
-        ))
+        if fields["idempotency_key"] is None:
+            fields["idempotency_key"] = self._default_idempotency_key("fixture_context_observations", fields, ("fixture_id", "provider", "raw_payload_hash", "mapping_version", "observed_at_utc"))
         return self._append_evidence("fixture_context_observations", fields)
 
     def append_team_metric(self, **fields: object) -> str:
+        unknown = set(fields).difference(EVIDENCE_FIELDS["team_metric_observations"])
+        if unknown:
+            raise ValueError(f"unsupported evidence fields: {sorted(unknown)}")
+        fields = {field: fields.get(field) for field in EVIDENCE_FIELDS["team_metric_observations"]}
         fields["observed_at_utc"] = normalize_utc(str(fields["observed_at_utc"]))
         if fields.get("team_side") not in ("HOME", "AWAY"):
             raise ValueError("team_side must be HOME or AWAY")
@@ -388,13 +424,15 @@ class Database:
         for key in ("period_start_utc", "period_end_utc"):
             if fields.get(key) is not None:
                 fields[key] = normalize_utc(str(fields[key]))
-        fields.setdefault("idempotency_key", self._default_idempotency_key(
-            "team_metric_observations", fields,
-            ("fixture_id", "provider", "raw_payload_hash", "mapping_version", "observed_at_utc", "team_side", "metric_name"),
-        ))
+        if fields["idempotency_key"] is None:
+            fields["idempotency_key"] = self._default_idempotency_key("team_metric_observations", fields, ("fixture_id", "provider", "raw_payload_hash", "mapping_version", "observed_at_utc", "team_side", "metric_name"))
         return self._append_evidence("team_metric_observations", fields)
 
     def append_player_availability(self, **fields: object) -> str:
+        unknown = set(fields).difference(EVIDENCE_FIELDS["player_availability_observations"])
+        if unknown:
+            raise ValueError(f"unsupported evidence fields: {sorted(unknown)}")
+        fields = {field: fields.get(field) for field in EVIDENCE_FIELDS["player_availability_observations"]}
         fields["observed_at_utc"] = normalize_utc(str(fields["observed_at_utc"]))
         if fields.get("team_side") not in ("HOME", "AWAY"):
             raise ValueError("team_side must be HOME or AWAY")
@@ -405,13 +443,18 @@ class Database:
             raise ValueError("player_reference or player_name is required")
         fields["player_reference"], fields["player_name"] = player_reference, player_name
         fields["source_confidence"] = self._evidence_number(fields.get("source_confidence"), "source_confidence", allow_none=True)
-        fields.setdefault("idempotency_key", self._default_idempotency_key(
-            "player_availability_observations", fields,
-            ("fixture_id", "provider", "raw_payload_hash", "mapping_version", "observed_at_utc", "team_side", "player_reference", "player_name"),
-        ))
+        player_identity = player_reference if player_reference is not None else player_name
+        fields["player_identity"] = player_identity
+        if fields["idempotency_key"] is None:
+            fields["idempotency_key"] = self._default_idempotency_key("player_availability_observations", fields, ("fixture_id", "provider", "raw_payload_hash", "mapping_version", "observed_at_utc", "team_side", "player_identity"))
+        fields.pop("player_identity")
         return self._append_evidence("player_availability_observations", fields)
 
     def append_lineup(self, **fields: object) -> str:
+        unknown = set(fields).difference(EVIDENCE_FIELDS["lineup_observations"])
+        if unknown:
+            raise ValueError(f"unsupported evidence fields: {sorted(unknown)}")
+        fields = {field: fields.get(field) for field in EVIDENCE_FIELDS["lineup_observations"]}
         fields["observed_at_utc"] = normalize_utc(str(fields["observed_at_utc"]))
         if fields.get("team_side") not in ("HOME", "AWAY"):
             raise ValueError("team_side must be HOME or AWAY")
@@ -423,10 +466,11 @@ class Database:
             raise ValueError("player_reference or player_name is required")
         fields["player_reference"], fields["player_name"] = player_reference, player_name
         fields["shirt_number"] = self._evidence_number(fields.get("shirt_number"), "shirt_number", integer=True, allow_none=True)
-        fields.setdefault("idempotency_key", self._default_idempotency_key(
-            "lineup_observations", fields,
-            ("fixture_id", "provider", "raw_payload_hash", "mapping_version", "observed_at_utc", "team_side", "player_reference", "player_name", "lineup_status"),
-        ))
+        player_identity = player_reference if player_reference is not None else player_name
+        fields["player_identity"] = player_identity
+        if fields["idempotency_key"] is None:
+            fields["idempotency_key"] = self._default_idempotency_key("lineup_observations", fields, ("fixture_id", "provider", "raw_payload_hash", "mapping_version", "observed_at_utc", "team_side", "player_identity", "lineup_status"))
+        fields.pop("player_identity")
         return self._append_evidence("lineup_observations", fields)
 
     def record_audit(self, event_type: str, *, entity_type: str | None = None, entity_id: str | None = None, payload_json: str = "{}") -> None:
