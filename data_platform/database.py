@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+import hashlib
+import json
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +13,10 @@ from uuid import uuid4
 
 from .domain import DecisionAction, ExecutionStatus, LedgerBook, SettlementOutcome
 from .settlement import pnl_for
+
+
+class IdempotencyConflictError(ValueError):
+    """Raised when an idempotency key is reused for different evidence facts."""
 
 
 SCHEMA = """
@@ -319,11 +325,24 @@ class Database:
             raise ValueError(f"{name} must be an integer")
         return int(value) if integer else float(value)
 
+    @staticmethod
+    def _default_idempotency_key(table: str, fields: dict[str, object], identity_fields: tuple[str, ...]) -> str:
+        identity = {"evidence_type": table, **{key: fields.get(key) for key in identity_fields}}
+        canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _validate_idempotency_key(value: object) -> str:
+        if isinstance(value, bool) or not isinstance(value, str) or not value.strip():
+            raise ValueError("idempotency_key must be a non-empty string")
+        return value.strip()
+
     def _append_evidence(self, table: str, fields: dict[str, object]) -> str:
         self._assert_writable()
         for key in ("provider", "source_reference", "raw_payload_hash", "mapping_version", "validation_status"):
             self._evidence_text(fields.get(key), key)
         fields["observed_at_utc"] = normalize_utc(str(fields["observed_at_utc"]))
+        fields["idempotency_key"] = self._validate_idempotency_key(fields.get("idempotency_key"))
         columns = tuple(fields)
         placeholders = ", ".join(f":{column}" for column in columns)
         observation_id = str(uuid4())
@@ -336,21 +355,31 @@ class Database:
         except sqlite3.IntegrityError as error:
             if "idempotency_key" in str(error):
                 with self.connection() as connection:
-                    row = connection.execute(f"SELECT id FROM {table} WHERE idempotency_key = ?", (fields["idempotency_key"],)).fetchone()
+                    row = connection.execute(f"SELECT * FROM {table} WHERE idempotency_key = ?", (fields["idempotency_key"],)).fetchone()
                 if row is not None:
+                    for field, value in fields.items():
+                        if row[field] != value:
+                            raise IdempotencyConflictError(
+                                f"idempotency_key conflicts with existing {table} evidence"
+                            )
                     return str(row["id"])
             raise
         return observation_id
 
     def append_fixture_context(self, **fields: object) -> str:
-        fields.setdefault("idempotency_key", f"context:{fields.get('provider')}:{fields.get('raw_payload_hash')}")
+        fields["observed_at_utc"] = normalize_utc(str(fields["observed_at_utc"]))
         if fields.get("neutral_venue") not in (None, True, False):
             raise ValueError("neutral_venue must be bool or None")
         if fields.get("neutral_venue") is not None:
             fields["neutral_venue"] = int(bool(fields["neutral_venue"]))
+        fields.setdefault("idempotency_key", self._default_idempotency_key(
+            "fixture_context_observations", fields,
+            ("fixture_id", "provider", "raw_payload_hash", "mapping_version", "observed_at_utc"),
+        ))
         return self._append_evidence("fixture_context_observations", fields)
 
     def append_team_metric(self, **fields: object) -> str:
+        fields["observed_at_utc"] = normalize_utc(str(fields["observed_at_utc"]))
         if fields.get("team_side") not in ("HOME", "AWAY"):
             raise ValueError("team_side must be HOME or AWAY")
         fields["metric_name"] = self._evidence_text(fields.get("metric_name"), "metric_name")
@@ -359,24 +388,45 @@ class Database:
         for key in ("period_start_utc", "period_end_utc"):
             if fields.get(key) is not None:
                 fields[key] = normalize_utc(str(fields[key]))
-        fields.setdefault("idempotency_key", f"metric:{fields.get('provider')}:{fields.get('raw_payload_hash')}:{fields.get('team_side')}:{fields.get('metric_name')}")
+        fields.setdefault("idempotency_key", self._default_idempotency_key(
+            "team_metric_observations", fields,
+            ("fixture_id", "provider", "raw_payload_hash", "mapping_version", "observed_at_utc", "team_side", "metric_name"),
+        ))
         return self._append_evidence("team_metric_observations", fields)
 
     def append_player_availability(self, **fields: object) -> str:
+        fields["observed_at_utc"] = normalize_utc(str(fields["observed_at_utc"]))
         if fields.get("team_side") not in ("HOME", "AWAY"):
             raise ValueError("team_side must be HOME or AWAY")
         fields["availability_status"] = self._evidence_text(fields.get("availability_status"), "availability_status")
+        player_reference = self._evidence_text(fields.get("player_reference"), "player_reference", allow_none=True)
+        player_name = self._evidence_text(fields.get("player_name"), "player_name", allow_none=True)
+        if player_reference is None and player_name is None:
+            raise ValueError("player_reference or player_name is required")
+        fields["player_reference"], fields["player_name"] = player_reference, player_name
         fields["source_confidence"] = self._evidence_number(fields.get("source_confidence"), "source_confidence", allow_none=True)
-        fields.setdefault("idempotency_key", f"availability:{fields.get('provider')}:{fields.get('raw_payload_hash')}:{fields.get('team_side')}:{fields.get('player_reference')}")
+        fields.setdefault("idempotency_key", self._default_idempotency_key(
+            "player_availability_observations", fields,
+            ("fixture_id", "provider", "raw_payload_hash", "mapping_version", "observed_at_utc", "team_side", "player_reference", "player_name"),
+        ))
         return self._append_evidence("player_availability_observations", fields)
 
     def append_lineup(self, **fields: object) -> str:
+        fields["observed_at_utc"] = normalize_utc(str(fields["observed_at_utc"]))
         if fields.get("team_side") not in ("HOME", "AWAY"):
             raise ValueError("team_side must be HOME or AWAY")
         if fields.get("lineup_status") not in ("STARTER", "BENCH", "OUT", "UNKNOWN"):
             raise ValueError("invalid lineup_status")
+        player_reference = self._evidence_text(fields.get("player_reference"), "player_reference", allow_none=True)
+        player_name = self._evidence_text(fields.get("player_name"), "player_name", allow_none=True)
+        if player_reference is None and player_name is None:
+            raise ValueError("player_reference or player_name is required")
+        fields["player_reference"], fields["player_name"] = player_reference, player_name
         fields["shirt_number"] = self._evidence_number(fields.get("shirt_number"), "shirt_number", integer=True, allow_none=True)
-        fields.setdefault("idempotency_key", f"lineup:{fields.get('provider')}:{fields.get('raw_payload_hash')}:{fields.get('team_side')}:{fields.get('player_reference')}")
+        fields.setdefault("idempotency_key", self._default_idempotency_key(
+            "lineup_observations", fields,
+            ("fixture_id", "provider", "raw_payload_hash", "mapping_version", "observed_at_utc", "team_side", "player_reference", "player_name", "lineup_status"),
+        ))
         return self._append_evidence("lineup_observations", fields)
 
     def record_audit(self, event_type: str, *, entity_type: str | None = None, entity_id: str | None = None, payload_json: str = "{}") -> None:

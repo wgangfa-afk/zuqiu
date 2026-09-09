@@ -55,7 +55,7 @@ class ReadRepository:
 
     @staticmethod
     def _limit(limit: int) -> int:
-        if not 1 <= limit <= 5000:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 5000:
             raise InvalidReadFilterError("limit must be between 1 and 5000")
         return limit
 

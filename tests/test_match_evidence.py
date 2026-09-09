@@ -3,7 +3,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from data_platform.read_api import InvalidReadFilterError, ReadRepository
+from data_platform import IdempotencyConflictError
+from data_platform.read_api import DatabaseNotHealthyError, InvalidReadFilterError, ReadRepository, RecordNotFoundError
 from data_platform.recovery import _rows, _table_digests, create_backup, restore_backup
 
 
@@ -74,3 +75,71 @@ def test_evidence_filters_future_boundary_and_backup_restore(database, fixture_i
         assert {key: digests[key] for key in evidence_tables} == {key: before[1][key] for key in evidence_tables}
         with pytest.raises(Exception):
             connection.execute("DELETE FROM lineup_observations")
+
+
+@pytest.mark.parametrize("method, fields", [
+    ("append_fixture_context", {"competition_name": "League"}),
+    ("append_team_metric", {"team_side": "HOME", "metric_name": "xg", "metric_value": 1.0}),
+    ("append_player_availability", {"team_side": "HOME", "player_name": "Player", "availability_status": "OUT"}),
+    ("append_lineup", {"team_side": "HOME", "player_name": "Player", "lineup_status": "STARTER"}),
+])
+def test_evidence_default_idempotency_is_fixture_scoped(database, fixture_id, method, fields):
+    second = database.create_fixture(provider="p", provider_fixture_id=f"second-{method}", home_team="H", away_team="A", kickoff_at_utc="2026-09-09T10:00:00+00:00")
+    first_id = getattr(database, method)(**common(fixture_id, **fields))
+    assert getattr(database, method)(**common(fixture_id, **fields)) == first_id
+    second_id = getattr(database, method)(**common(second, **fields))
+    assert second_id != first_id
+    repository = ReadRepository(database)
+    assert len(getattr(repository, {"append_fixture_context": "list_fixture_context", "append_team_metric": "list_team_metrics", "append_player_availability": "list_player_availability", "append_lineup": "list_lineups"}[method])(fixture_id)) == 1
+    assert len(getattr(repository, {"append_fixture_context": "list_fixture_context", "append_team_metric": "list_team_metrics", "append_player_availability": "list_player_availability", "append_lineup": "list_lineups"}[method])(second)) == 1
+
+
+def test_idempotency_conflict_and_player_name_identity(database, fixture_id):
+    first = common(fixture_id, team_side="HOME", player_name="One", lineup_status="STARTER", idempotency_key="explicit-key")
+    record_id = database.append_lineup(**first)
+    with pytest.raises(IdempotencyConflictError):
+        database.append_lineup(**{**first, "lineup_status": "BENCH"})
+    assert database.append_lineup(**first) == record_id
+    one = database.append_lineup(**common(fixture_id, player_name="No Id One", team_side="HOME", lineup_status="STARTER", raw_payload_hash="lineup-one"))
+    two = database.append_lineup(**common(fixture_id, player_name="No Id Two", team_side="HOME", lineup_status="STARTER", raw_payload_hash="lineup-one"))
+    assert one != two
+    for method, fields in (
+        (database.append_player_availability, {"team_side": "HOME", "availability_status": "OUT"}),
+        (database.append_lineup, {"team_side": "HOME", "lineup_status": "OUT"}),
+    ):
+        with pytest.raises(ValueError):
+            method(**common(fixture_id, **fields))
+
+
+@pytest.mark.parametrize("field, value", [
+    ("provider", ""), ("source_reference", " "), ("raw_payload_hash", ""),
+    ("mapping_version", ""), ("validation_status", ""), ("idempotency_key", " "),
+    ("idempotency_key", 1),
+])
+def test_evidence_required_text_and_key_validation(database, fixture_id, field, value):
+    with pytest.raises(ValueError):
+        database.append_fixture_context(**common(fixture_id, competition_name="League", **{field: value}))
+    with pytest.raises(Exception):
+        database.append_fixture_context(**common("missing", competition_name="League", raw_payload_hash="other"))
+
+
+def test_read_evidence_filter_boundaries_and_health(database, fixture_id, tmp_path):
+    seed(database, fixture_id)
+    repository = ReadRepository(database)
+    for bad_limit in (0, 5001, True):
+        with pytest.raises(InvalidReadFilterError):
+            repository.list_fixture_context(fixture_id, limit=bad_limit)
+    with pytest.raises(InvalidReadFilterError):
+        repository.list_lineups(fixture_id, observed_before=datetime(2026, 9, 8, 9, 0))
+    with pytest.raises(InvalidReadFilterError):
+        repository.list_lineups(fixture_id, lineup_status="BAD")
+    with pytest.raises(RecordNotFoundError):
+        repository.list_fixture_context("missing")
+    from data_platform.database import Database
+    unverified = Database(tmp_path / "unverified-evidence.sqlite3")
+    unverified.initialize()
+    with pytest.raises(DatabaseNotHealthyError):
+        ReadRepository(unverified)
+    database.require_recovery()
+    with pytest.raises(DatabaseNotHealthyError):
+        ReadRepository(database)
