@@ -19,8 +19,11 @@ from .settlement import pnl_for
 CURRENT_SCHEMA_VERSION = 3
 APPLICATION_VERSION = "FQ-V6-002"
 P0_TABLES = ("fixtures", "market_snapshots", "analysis_decisions", "executions", "settlements", "review_records", "bankroll_ledger", "audit_logs", "schema_version", "system_state")
-DIGEST_TABLES = ("executions", "settlements", "bankroll_ledger", "market_snapshots")
-REQUIRED_MANIFEST_FIELDS = {"backup_id", "database_path", "schema_version", "database_sha256", "table_row_counts", "table_digests", "created_at_utc"}
+DIGEST_TABLES = P0_TABLES
+REQUIRED_MANIFEST_FIELDS = {
+    "backup_id", "database_path", "schema_version", "database_sha256",
+    "table_row_counts", "table_digests", "official_performance", "created_at_utc",
+}
 LOGGER = logging.getLogger(__name__)
 
 
@@ -41,7 +44,8 @@ def _table_digests(connection: sqlite3.Connection) -> dict[str, str]:
     digests: dict[str, str] = {}
     for table in DIGEST_TABLES:
         columns = [row["name"] for row in connection.execute(f"PRAGMA table_info({table})")]
-        rows = connection.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+        order_by = ", ".join(f'"{column}"' for column in columns)
+        rows = connection.execute(f"SELECT * FROM {table} ORDER BY {order_by}").fetchall()
         payload = [{column: row[column] for column in columns} for row in rows]
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         digests[table] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -104,6 +108,41 @@ def _execution_reconciliation(connection: sqlite3.Connection) -> tuple[list[str]
     return errors, expected_balance, len(executions)
 
 
+def _three_book_reconciliation(connection: sqlite3.Connection) -> list[str]:
+    """Prove that review references cannot cross Analysis/Execution/Counterfactual books."""
+    errors: list[str] = []
+    rows = connection.execute(
+        """SELECT r.id, r.book, r.execution_id, r.decision_id, d.book AS decision_book
+           FROM review_records r
+           LEFT JOIN analysis_decisions d ON d.id = r.decision_id
+           ORDER BY r.id"""
+    ).fetchall()
+    for row in rows:
+        if row["book"] == "execution":
+            if row["execution_id"] is None or row["decision_id"] is not None:
+                errors.append(f"{row['id']}: execution review has invalid book reference")
+        elif row["book"] in ("analysis", "counterfactual"):
+            if (
+                row["decision_id"] is None
+                or row["execution_id"] is not None
+                or row["decision_book"] != row["book"]
+            ):
+                errors.append(f"{row['id']}: decision review crosses book boundary")
+        else:
+            errors.append(f"{row['id']}: unsupported review book")
+    return errors
+
+
+def _official_performance(connection: sqlite3.Connection) -> dict[str, float]:
+    row = connection.execute(
+        """SELECT COALESCE(SUM(s.pnl_u), 0) AS pnl, COALESCE(SUM(e.stake_u), 0) AS stake
+           FROM executions e JOIN settlements s ON s.execution_id = e.id
+           WHERE e.status = 'settled'"""
+    ).fetchone()
+    stake, pnl = float(row["stake"]), float(row["pnl"])
+    return {"pnl_u": pnl, "stake_u": stake, "roi": pnl / stake if stake else 0.0}
+
+
 @dataclass(frozen=True)
 class IntegrityReport:
     ok: bool
@@ -135,12 +174,23 @@ def startup_integrity_check(database: Database, *, audit: bool = True) -> Integr
             try:
                 fact_errors, rebuilt, _ = _execution_reconciliation(connection)
                 errors.extend(fact_errors)
+                errors.extend(_three_book_reconciliation(connection))
                 stored = float(connection.execute("SELECT COALESCE(SUM(amount_u), 0) FROM bankroll_ledger").fetchone()[0])
                 if _different(stored, rebuilt):
                     errors.append("bankroll total differs from per-execution rebuild")
-                trigger_count = connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'market_snapshots_are_append_only_%'").fetchone()[0]
-                if trigger_count != 2:
-                    errors.append("market snapshot append-only triggers missing")
+                required_append_only = {
+                    "market_snapshots_are_append_only_update", "market_snapshots_are_append_only_delete",
+                    "settlements_are_append_only_update", "settlements_are_append_only_delete",
+                    "bankroll_ledger_is_append_only_update", "bankroll_ledger_is_append_only_delete",
+                }
+                present = {
+                    row[0] for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='trigger'"
+                    )
+                }
+                missing = sorted(required_append_only.difference(present))
+                if missing:
+                    errors.append(f"append-only triggers missing: {missing}")
             except sqlite3.DatabaseError as error:
                 errors.append(f"financial fact reconciliation failed: {error}")
     except sqlite3.DatabaseError as error:
@@ -193,12 +243,13 @@ def create_backup(database: Database, destination: Path, *, git_commit_sha: str 
         backup_connection.row_factory = sqlite3.Row
         try:
             row_counts, table_digests = _rows(backup_connection), _table_digests(backup_connection)
+            official_performance = _official_performance(backup_connection)
             schema_version = backup_connection.execute("SELECT version FROM schema_version").fetchone()[0]
             last_locked = backup_connection.execute("SELECT MAX(locked_at_utc) FROM executions").fetchone()[0]
             last_settlement = backup_connection.execute("SELECT MAX(settled_at_utc) FROM settlements").fetchone()[0]
         finally:
             backup_connection.close()
-        manifest = {"backup_id": backup_id, "created_at_utc": datetime.now(timezone.utc).isoformat(), "application_version": APPLICATION_VERSION, "database_path": database_file.name, "schema_version": schema_version, "git_commit_sha": git_commit_sha, "db_size": database_tmp.stat().st_size, "database_sha256": _sha256(database_tmp), "sqlite_version": sqlite3.sqlite_version, "health_status": database.health_state, "table_row_counts": row_counts, "table_digests": table_digests, "last_execution_locked_at": last_locked, "last_settlement_at": last_settlement}
+        manifest = {"backup_id": backup_id, "created_at_utc": datetime.now(timezone.utc).isoformat(), "application_version": APPLICATION_VERSION, "database_path": database_file.name, "schema_version": schema_version, "git_commit_sha": git_commit_sha, "db_size": database_tmp.stat().st_size, "database_sha256": _sha256(database_tmp), "sqlite_version": sqlite3.sqlite_version, "health_status": database.health_state, "table_row_counts": row_counts, "table_digests": table_digests, "official_performance": official_performance, "last_execution_locked_at": last_locked, "last_settlement_at": last_settlement}
         with manifest_tmp.open("w", encoding="utf-8") as stream:
             json.dump(manifest, stream, indent=2, sort_keys=True)
             stream.flush()
@@ -259,17 +310,33 @@ def restore_backup(manifest_path: Path, target_path: Path) -> Database:
                 raise ValueError("restored row counts do not match manifest")
             if _table_digests(connection) != manifest["table_digests"]:
                 raise ValueError("restored table digests do not match manifest")
+            restored_performance = _official_performance(connection)
+            expected_performance = manifest["official_performance"]
+            if not isinstance(expected_performance, dict) or any(
+                key not in expected_performance or _different(restored_performance[key], expected_performance[key])
+                for key in ("pnl_u", "stake_u", "roi")
+            ):
+                raise ValueError("restored ROI/PnL does not match backup manifest")
         report = startup_integrity_check(restored, audit=False)
         if not report.ok:
             raise ValueError(f"restored database failed integrity check: {report.errors}")
         restored.record_audit("restore_started", payload_json=json.dumps({"backup_id": manifest["backup_id"]}))
+        _fsync_file(restore_tmp)
         os.replace(restore_tmp, target_path)
         final = Database(target_path)
         final.mark_healthy("restored_verified")
         final.record_audit("restore_completed", payload_json=json.dumps({"backup_id": manifest["backup_id"]}))
+        final_report = startup_integrity_check(final, audit=False)
+        if not final_report.ok or any(
+            _different(final.official_performance()[key], manifest["official_performance"][key])
+            for key in ("pnl_u", "stake_u", "roi")
+        ):
+            raise RuntimeError("published restore failed final reopen verification")
         return final
     except Exception:
         restore_tmp.unlink(missing_ok=True)
+        if target_path.exists():
+            target_path.unlink()
         LOGGER.exception("restore failed")
         raise
 

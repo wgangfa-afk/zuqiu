@@ -88,4 +88,14 @@ manifest = create_backup(db, Path("../backup/manual"))
 restored = restore_backup(manifest, Path("../recovery-test.sqlite3"))
 ```
 
+也可直接使用命令行完成真实备份与恢复演练（恢复目标必须是尚不存在的新文件）：
+
+```powershell
+python -m data_platform backup --destination ..\backup\manual
+python -m data_platform restore --manifest ..\backup\manual\<backup-id>.manifest.json --destination ..\recovery-test.sqlite3
+python -m data_platform health
+```
+
+manifest 会保存全部 P0 表的逐表摘要及正式 `stake/ROI/PnL` 基线。恢复过程先在临时数据库完成 checksum、row count、逐表 digest、账本重建、三账边界和 ROI/PnL 校验，通过后才原子发布到新路径；失败时不会覆盖既有目标。
+
 任何完整性失败都会使当前 `Database` 进入 `RECOVERY_REQUIRED`，阻止正式 Execution、锁单、结算和盘口快照写入；必须恢复到新数据库并重新通过检查后才可恢复运行。

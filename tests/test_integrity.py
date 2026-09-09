@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from uuid import uuid4
 
 import pytest
 
@@ -118,6 +119,17 @@ def test_market_snapshots_cannot_be_updated_or_deleted(database, fixture_id):
             connection.execute("DELETE FROM market_snapshots WHERE id = ?", (snapshot_id,))
 
 
+def test_settlement_and_bankroll_are_append_only(database, fixture_id):
+    execution_id = database.create_execution(action=DecisionAction.BET, **execution_fields(fixture_id))
+    database.lock_execution(execution_id, "2026-09-08T09:59:00+00:00")
+    database.add_settlement(execution_id=execution_id, outcome=SettlementOutcome.WIN, result_payload_reference="synthetic://ft")
+    with database.connection() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            connection.execute("UPDATE settlements SET clv=9 WHERE execution_id=?", (execution_id,))
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            connection.execute("DELETE FROM bankroll_ledger WHERE execution_id=?", (execution_id,))
+
+
 @pytest.mark.parametrize(
     ("column", "value"),
     [
@@ -169,3 +181,19 @@ def test_initialize_refreshes_existing_trigger_definitions(database, fixture_id)
     with database.connection() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             connection.execute("UPDATE executions SET stake_cny = 200 WHERE id = ?", (execution_id,))
+
+
+def test_analysis_execution_counterfactual_review_books_cannot_cross(database, fixture_id):
+    decision_id = database.create_analysis_decision(
+        book=LedgerBook.ANALYSIS, action=DecisionAction.PASS, fixture_id=fixture_id,
+        market_type="asian_total", selection="under", rating="PASS",
+        source_reference="synthetic://analysis",
+    )
+    with database.connection() as connection:
+        connection.execute(
+            "INSERT INTO review_records VALUES (?, 'counterfactual', NULL, ?, NULL, ?, 'crossed book')",
+            (str(uuid4()), decision_id, "2026-09-08T12:00:00+00:00"),
+        )
+    report = startup_integrity_check(database)
+    assert not report.ok
+    assert any("crosses book boundary" in error for error in report.errors)

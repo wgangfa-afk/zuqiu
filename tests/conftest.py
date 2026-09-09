@@ -8,7 +8,9 @@ from data_platform.recovery import startup_integrity_check
 
 @pytest.fixture()
 def database(tmp_path):
-    db = Database(tmp_path / "alpha.sqlite3")
+    # Keep lifecycle tests deterministic; wall-clock time must never make the
+    # synthetic fixture silently become a post-kickoff execution.
+    db = Database(tmp_path / "alpha.sqlite3", clock=lambda: "2026-09-08T09:00:00+00:00")
     db.initialize()
     assert startup_integrity_check(db).ok
     return db

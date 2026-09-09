@@ -154,6 +154,18 @@ WHEN NOT (
     (OLD.status = 'settled' AND NEW.status = 'settled')
 )
 BEGIN SELECT RAISE(ABORT, 'execution status transition is invalid'); END;
+CREATE TRIGGER IF NOT EXISTS settlements_are_append_only_update
+BEFORE UPDATE ON settlements
+BEGIN SELECT RAISE(ABORT, 'settlements are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS settlements_are_append_only_delete
+BEFORE DELETE ON settlements
+BEGIN SELECT RAISE(ABORT, 'settlements are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS bankroll_ledger_is_append_only_update
+BEFORE UPDATE ON bankroll_ledger
+BEGIN SELECT RAISE(ABORT, 'bankroll ledger is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS bankroll_ledger_is_append_only_delete
+BEFORE DELETE ON bankroll_ledger
+BEGIN SELECT RAISE(ABORT, 'bankroll ledger is append-only'); END;
 """
 
 TRIGGER_NAMES = (
@@ -164,6 +176,10 @@ TRIGGER_NAMES = (
     "locked_execution_is_immutable",
     "execution_lock_must_precede_kickoff",
     "execution_status_is_forward_only",
+    "settlements_are_append_only_update",
+    "settlements_are_append_only_delete",
+    "bankroll_ledger_is_append_only_update",
+    "bankroll_ledger_is_append_only_delete",
 )
 
 def utc_now() -> str:
@@ -371,9 +387,19 @@ class Database:
         self._assert_writable()
         settlement_id = str(uuid4())
         with self.connection() as connection:
-            existing = connection.execute("SELECT id, outcome FROM settlements WHERE execution_id = ?", (execution_id,)).fetchone()
+            existing = connection.execute(
+                "SELECT id, outcome, result_payload_reference, clv FROM settlements WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
             if existing is not None:
-                if existing["outcome"] == outcome.value:
+                same_clv = (existing["clv"] is None and clv is None) or (
+                    existing["clv"] is not None and clv is not None and abs(float(existing["clv"]) - float(clv)) <= 1e-9
+                )
+                if (
+                    existing["outcome"] == outcome.value
+                    and existing["result_payload_reference"] == result_payload_reference
+                    and same_clv
+                ):
                     return existing["id"]
                 raise ValueError("Conflicting settlement already exists for execution")
             row = connection.execute("SELECT status, stake_u, odds FROM executions WHERE id = ?", (execution_id,)).fetchone()
