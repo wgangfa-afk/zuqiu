@@ -7,7 +7,10 @@ from typing import Any
 
 from .database import Database
 from .domain import DecisionAction, ExecutionStatus, LedgerBook, SettlementOutcome
-from .read_models import AnalysisDecisionRecord, ExecutionRecord, FixtureRecord, MarketSnapshotRecord, SettlementRecord
+from .read_models import (
+    AnalysisDecisionRecord, ExecutionRecord, FixtureContextRecord, FixtureRecord, LineupRecord,
+    MarketSnapshotRecord, PlayerAvailabilityRecord, SettlementRecord, TeamMetricRecord,
+)
 
 
 class RecordNotFoundError(LookupError):
@@ -52,7 +55,7 @@ class ReadRepository:
 
     @staticmethod
     def _limit(limit: int) -> int:
-        if not 1 <= limit <= 5000:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 5000:
             raise InvalidReadFilterError("limit must be between 1 and 5000")
         return limit
 
@@ -151,3 +154,58 @@ class ReadRepository:
                 raise RecordNotFoundError(f"execution not found: {execution_id}")
             row = connection.execute("SELECT * FROM settlements WHERE execution_id = ?", (execution_id,)).fetchone()
         return None if row is None else self._settlement(row)
+
+    def _list_evidence(self, table: str, mapper: Any, fixture_id: str, *, observed_before: datetime | None, provider: str | None, validation_status: str | None, limit: int, extra: tuple[tuple[str, object], ...] = ()) -> tuple[Any, ...]:
+        self._require_healthy()
+        self.get_fixture(fixture_id)
+        clauses, values = ["fixture_id = ?"], [fixture_id]
+        for column, value in (("provider", provider), ("validation_status", validation_status), *extra):
+            if value is not None:
+                if not isinstance(value, str) or not value:
+                    raise InvalidReadFilterError(f"{column} must be a non-empty string")
+                clauses.append(f"{column} = ?")
+                values.append(value)
+        before = _require_utc(observed_before, "observed_before")
+        if before is not None:
+            clauses.append("observed_at_utc <= ?")
+            values.append(before)
+        values.append(self._limit(limit))
+        with self._database.connection() as connection:
+            rows = connection.execute(f"SELECT * FROM {table} WHERE {' AND '.join(clauses)} ORDER BY observed_at_utc ASC, id ASC LIMIT ?", values).fetchall()
+        return tuple(mapper(row) for row in rows)
+
+    @staticmethod
+    def _context(row: Any) -> FixtureContextRecord:
+        return FixtureContextRecord(row["id"], row["fixture_id"], row["competition_name"], row["country_code"], row["season"], row["competition_round"], row["venue_name"], None if row["neutral_venue"] is None else bool(row["neutral_venue"]), row["referee_name"], row["provider"], row["source_reference"], _utc_datetime(row["observed_at_utc"]), row["validation_status"], row["raw_payload_hash"], row["mapping_version"])
+
+    @staticmethod
+    def _metric(row: Any) -> TeamMetricRecord:
+        return TeamMetricRecord(row["id"], row["fixture_id"], row["team_side"], row["metric_name"], float(row["metric_value"]), row["unit"], _utc_datetime(row["period_start_utc"]), _utc_datetime(row["period_end_utc"]), row["sample_size"], row["provider"], row["source_reference"], _utc_datetime(row["observed_at_utc"]), row["validation_status"], row["raw_payload_hash"], row["mapping_version"])
+
+    @staticmethod
+    def _availability(row: Any) -> PlayerAvailabilityRecord:
+        return PlayerAvailabilityRecord(row["id"], row["fixture_id"], row["team_side"], row["player_reference"], row["player_name"], row["availability_status"], row["reported_reason"], row["source_confidence"], row["provider"], row["source_reference"], _utc_datetime(row["observed_at_utc"]), row["validation_status"], row["raw_payload_hash"], row["mapping_version"])
+
+    @staticmethod
+    def _lineup(row: Any) -> LineupRecord:
+        return LineupRecord(row["id"], row["fixture_id"], row["team_side"], row["player_reference"], row["player_name"], row["lineup_status"], row["position"], row["shirt_number"], row["provider"], row["source_reference"], _utc_datetime(row["observed_at_utc"]), row["validation_status"], row["raw_payload_hash"], row["mapping_version"])
+
+    def list_fixture_context(self, fixture_id: str, *, observed_before: datetime | None = None, provider: str | None = None, validation_status: str | None = None, limit: int = 1000) -> tuple[FixtureContextRecord, ...]:
+        return self._list_evidence("fixture_context_observations", self._context, fixture_id, observed_before=observed_before, provider=provider, validation_status=validation_status, limit=limit)
+
+    def list_team_metrics(self, fixture_id: str, *, team_side: str | None = None, metric_name: str | None = None, observed_before: datetime | None = None, provider: str | None = None, validation_status: str | None = None, limit: int = 1000) -> tuple[TeamMetricRecord, ...]:
+        if team_side is not None and team_side not in {"HOME", "AWAY"}:
+            raise InvalidReadFilterError("team_side must be HOME or AWAY")
+        return self._list_evidence("team_metric_observations", self._metric, fixture_id, observed_before=observed_before, provider=provider, validation_status=validation_status, limit=limit, extra=(("team_side", team_side), ("metric_name", metric_name)))
+
+    def list_player_availability(self, fixture_id: str, *, team_side: str | None = None, observed_before: datetime | None = None, provider: str | None = None, validation_status: str | None = None, limit: int = 1000) -> tuple[PlayerAvailabilityRecord, ...]:
+        if team_side is not None and team_side not in {"HOME", "AWAY"}:
+            raise InvalidReadFilterError("team_side must be HOME or AWAY")
+        return self._list_evidence("player_availability_observations", self._availability, fixture_id, observed_before=observed_before, provider=provider, validation_status=validation_status, limit=limit, extra=(("team_side", team_side),))
+
+    def list_lineups(self, fixture_id: str, *, team_side: str | None = None, lineup_status: str | None = None, observed_before: datetime | None = None, provider: str | None = None, validation_status: str | None = None, limit: int = 1000) -> tuple[LineupRecord, ...]:
+        if team_side is not None and team_side not in {"HOME", "AWAY"}:
+            raise InvalidReadFilterError("team_side must be HOME or AWAY")
+        if lineup_status is not None and lineup_status not in {"STARTER", "BENCH", "OUT", "UNKNOWN"}:
+            raise InvalidReadFilterError("invalid lineup_status")
+        return self._list_evidence("lineup_observations", self._lineup, fixture_id, observed_before=observed_before, provider=provider, validation_status=validation_status, limit=limit, extra=(("team_side", team_side), ("lineup_status", lineup_status)))

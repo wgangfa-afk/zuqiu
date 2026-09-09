@@ -155,7 +155,7 @@ def test_initialize_does_not_silently_upgrade_old_schema(database):
 
 def test_future_schema_version_is_rejected(database):
     with database.connection() as connection:
-        connection.execute("UPDATE schema_version SET version=4")
+        connection.execute("UPDATE schema_version SET version=5")
     database.initialize()
     assert not startup_integrity_check(database).ok
 
