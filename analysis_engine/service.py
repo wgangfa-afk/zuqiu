@@ -8,7 +8,7 @@ from data_platform.read_api import ReadRepository
 from data_platform.read_models import MarketSnapshotRecord
 
 from .models import MarketGroup, ModelProbability, PricedSelection, RoutingDecision
-from .exceptions import AnalysisInputError, InvalidOddsError, InvalidProbabilityError, MarketGroupError, UnsupportedSettlementModelError
+from .exceptions import AnalysisInputError, InvalidOddsError, InvalidProbabilityError, MarketGroupError
 from .ev import calculate
 from .pricing import devig, supports_binary_market, valid_odds, valid_probability
 from .rating import rate
@@ -62,7 +62,7 @@ class Phase1AnalysisService:
         selectable = next((item for item in ranked if item.rating in {"B+", "B"} and item.action is DecisionAction.WATCH and item.risk_adjusted_ev is not None and not hard.intersection(item.reason_codes)), None)
         if selectable is None:
             rejected = tuple(dict.fromkeys(code for item in ranked for code in item.reason_codes if code in hard))
-            below = any(item.risk_adjusted_ev is not None and item.risk_adjusted_ev > 0 for item in ranked)
+            below = any(ReasonCode.BELOW_WATCH_THRESHOLD in item.reason_codes for item in ranked)
             reasons = list(rejected)
             if below:
                 reasons.extend((ReasonCode.BELOW_WATCH_THRESHOLD, ReasonCode.PHASE1_EXECUTION_DISABLED))

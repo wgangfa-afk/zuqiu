@@ -51,6 +51,7 @@ def test_hard_data_quality_rejections_never_watch_or_select(database, fixture_id
     a, b = add(database, fixture_id, "home", 2.0, status=status), add(database, fixture_id, "away", 2.0, status=status)
     result = service(database).analyze(fixture_id=fixture_id, market_groups=(MarketGroup(fixture_id, "q", (a,b), True, True),), model_probabilities=(ModelProbability(a,.55), ModelProbability(b,.45)), generated_at_utc=datetime(2026,9,8,tzinfo=timezone.utc))
     assert result.selected is None and code in result.reason_codes
+    assert ReasonCode.BELOW_WATCH_THRESHOLD not in result.reason_codes
 
 
 def test_positive_edge_below_watch_threshold_has_truthful_pass_reason(database, fixture_id):
