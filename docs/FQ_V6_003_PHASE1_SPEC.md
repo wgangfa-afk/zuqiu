@@ -6,4 +6,6 @@ For a group, implied probability is `1 / decimal_odds`; de-vig probability is im
 
 Ratings are capped at B+. B+ requires risk-adjusted EV at least .04 and VALID data; B requires .02; C requires positive EV; otherwise PASS. B+/B map to WATCH, C/PASS map to PASS. BET is disabled because full team, lineup, tactical and market-validation models are absent.
 
+C means positive risk-adjusted EV below the WATCH threshold and carries `BELOW_WATCH_THRESHOLD`; it is not `NO_POSITIVE_EDGE`. `NO_POSITIVE_EDGE` is reserved for adjusted EV at or below zero. STALE, unverified, and unsupported markets are hard rejections.
+
 Asian, push, half-win/loss, corner, card and player settlement models return `UNSUPPORTED_SETTLEMENT_MODEL`; they are never evaluated with the binary EV formula. Router ranks adjusted EV, raw EV, newer observation time, then snapshot ID. No A operation writes B data, Execution, settlement or bankroll.

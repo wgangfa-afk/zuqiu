@@ -62,7 +62,13 @@ class Phase1AnalysisService:
         selectable = next((item for item in ranked if item.rating in {"B+", "B"} and item.action is DecisionAction.WATCH and item.risk_adjusted_ev is not None and not hard.intersection(item.reason_codes)), None)
         if selectable is None:
             rejected = tuple(dict.fromkeys(code for item in ranked for code in item.reason_codes if code in hard))
-            return RoutingDecision(fixture_id, None, ranked, DecisionAction.PASS, "PASS", rejected or (ReasonCode.NO_POSITIVE_EDGE,), generated_at_utc)
+            below = any(item.risk_adjusted_ev is not None and item.risk_adjusted_ev > 0 for item in ranked)
+            reasons = list(rejected)
+            if below:
+                reasons.extend((ReasonCode.BELOW_WATCH_THRESHOLD, ReasonCode.PHASE1_EXECUTION_DISABLED))
+            if not reasons:
+                reasons.append(ReasonCode.NO_POSITIVE_EDGE)
+            return RoutingDecision(fixture_id, None, ranked, DecisionAction.PASS, "PASS", tuple(dict.fromkeys(reasons)), generated_at_utc)
         reasons = tuple(dict.fromkeys((*selectable.reason_codes, ReasonCode.BEST_CROSS_MARKET_VALUE)))
         return RoutingDecision(fixture_id, selectable, ranked, DecisionAction.WATCH, selectable.rating, reasons, generated_at_utc)
 
@@ -99,9 +105,13 @@ class Phase1AnalysisService:
             elif snapshot.validation_status != "VALID": reasons.append(ReasonCode.UNVERIFIED_MARKET_DATA)
             if raw_ev > 0: reasons.append(ReasonCode.POSITIVE_RAW_EV)
             if adjusted > 0: reasons.append(ReasonCode.POSITIVE_RISK_ADJUSTED_EV)
-            if adjusted <= 0: reasons.extend((ReasonCode.NO_POSITIVE_EDGE, ReasonCode.PENALTY_EXCEEDS_RAW_EDGE))
+            if adjusted <= 0:
+                reasons.append(ReasonCode.NO_POSITIVE_EDGE)
+                if raw_ev > 0:
+                    reasons.append(ReasonCode.PENALTY_EXCEEDS_RAW_EDGE)
             hard = bool({ReasonCode.UNSUPPORTED_SETTLEMENT_MODEL, ReasonCode.STALE_MARKET_DATA, ReasonCode.UNVERIFIED_MARKET_DATA}.intersection(reasons))
             rating, action = rate(adjusted, snapshot.validation_status == "VALID" and not hard)
             if action is DecisionAction.WATCH: reasons.extend((ReasonCode.PHASE1_RATING_CAP, ReasonCode.PHASE1_EXECUTION_DISABLED))
+            elif rating == "C": reasons.extend((ReasonCode.BELOW_WATCH_THRESHOLD, ReasonCode.PHASE1_EXECUTION_DISABLED))
             output.append(PricedSelection(snapshot.fixture_id, snapshot.id, group.market_key, snapshot.market_type, snapshot.settlement_type, snapshot.validation_status, snapshot.selection, snapshot.line, snapshot.decimal_odds, implied_probability, devig_probability, model.probability, fair_odds, raw_ev, model.uncertainty_penalty, model.data_quality_penalty, model.correlation_penalty, adjusted, rating, action, tuple(dict.fromkeys(reasons)), snapshot.source_reference, snapshot.observed_at_utc))
         return tuple(output)
