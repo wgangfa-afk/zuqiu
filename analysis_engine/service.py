@@ -53,10 +53,16 @@ class Phase1AnalysisService:
             if missing: raise AnalysisInputError("missing model probability")
             candidates.extend(self._price_group(group, snapshots, probability_by_id))
         if set(probability_by_id) != expected_ids: raise AnalysisInputError("extra model probability")
-        ranked = tuple(sorted(candidates, key=lambda item: (item.risk_adjusted_ev is None, -(item.risk_adjusted_ev or 0), -(item.raw_ev or 0), 0 if item.market_type else 1, -item.observed_at_utc.timestamp(), item.snapshot_id)))
-        selectable = next((item for item in ranked if item.rating in {"B+", "B"} and item.action is DecisionAction.WATCH), None)
+        def quality(item: PricedSelection) -> int:
+            return 0 if item.validation_status == "VALID" else 1 if item.validation_status == "STALE" else 2
+        def numeric(value: float | None) -> float:
+            return value if value is not None else float("-inf")
+        ranked = tuple(sorted(candidates, key=lambda item: (item.risk_adjusted_ev is None, -numeric(item.risk_adjusted_ev), -numeric(item.raw_ev), quality(item), -item.observed_at_utc.timestamp(), item.snapshot_id)))
+        hard = {ReasonCode.UNSUPPORTED_SETTLEMENT_MODEL, ReasonCode.STALE_MARKET_DATA, ReasonCode.UNVERIFIED_MARKET_DATA}
+        selectable = next((item for item in ranked if item.rating in {"B+", "B"} and item.action is DecisionAction.WATCH and item.risk_adjusted_ev is not None and not hard.intersection(item.reason_codes)), None)
         if selectable is None:
-            return RoutingDecision(fixture_id, None, ranked, DecisionAction.PASS, "PASS", (ReasonCode.NO_POSITIVE_EDGE,), generated_at_utc)
+            rejected = tuple(dict.fromkeys(code for item in ranked for code in item.reason_codes if code in hard))
+            return RoutingDecision(fixture_id, None, ranked, DecisionAction.PASS, "PASS", rejected or (ReasonCode.NO_POSITIVE_EDGE,), generated_at_utc)
         reasons = tuple(dict.fromkeys((*selectable.reason_codes, ReasonCode.BEST_CROSS_MARKET_VALUE)))
         return RoutingDecision(fixture_id, selectable, ranked, DecisionAction.WATCH, selectable.rating, reasons, generated_at_utc)
 
@@ -66,21 +72,27 @@ class Phase1AnalysisService:
         if len({item.line for item in snapshots}) != 1: raise MarketGroupError("mixed line group")
         if len({item.observed_at_utc for item in snapshots}) != 1: raise MarketGroupError("mixed observation time group")
         if len({item.selection for item in snapshots}) != len(snapshots): raise MarketGroupError("duplicate selection")
-        if snapshots[0].market_type.lower() == "1x2" and len(snapshots) != 3: raise MarketGroupError("1x2 needs three selections")
+        market = snapshots[0].market_type.lower()
+        selections = {item.selection.lower() for item in snapshots}
+        expected = {"1x2": (3, {"home", "draw", "away"}), "moneyline": (2, None), "btts": (2, {"yes", "no"})}
+        if market in expected:
+            count, required = expected[market]
+            if len(snapshots) != count or (required is not None and selections != required):
+                raise MarketGroupError("invalid supported market selections")
         for snapshot in snapshots: valid_odds(snapshot.decimal_odds)
 
     def _price_group(self, group: MarketGroup, snapshots: tuple[MarketSnapshotRecord, ...], models: dict[str, ModelProbability]) -> tuple[PricedSelection, ...]:
         supported = supports_binary_market(snapshots[0].market_type, snapshots[0].settlement_type)
         devig_probabilities = devig(tuple(snapshot.decimal_odds for snapshot in snapshots)) if supported else (None,) * len(snapshots)
         implied = tuple(1 / float(snapshot.decimal_odds) for snapshot in snapshots) if supported else (None,) * len(snapshots)
-        if supported and abs(sum(models[item.id].probability for item in snapshots) - 1) > 1e-9: raise InvalidProbabilityError("group model probabilities must sum to one")
+        if abs(sum(models[item.id].probability for item in snapshots) - 1) > 1e-9: raise InvalidProbabilityError("group model probabilities must sum to one")
         output = []
         for snapshot, implied_probability, devig_probability in zip(snapshots, implied, devig_probabilities):
             model = models[snapshot.id]
             reasons: list[ReasonCode] = []
             if not supported:
                 reasons.extend((ReasonCode.UNSUPPORTED_SETTLEMENT_MODEL, ReasonCode.PHASE1_EXECUTION_DISABLED))
-                output.append(PricedSelection(snapshot.fixture_id, snapshot.id, group.market_key, snapshot.market_type, snapshot.settlement_type, snapshot.selection, snapshot.line, snapshot.decimal_odds, None, None, model.probability, None, None, model.uncertainty_penalty, model.data_quality_penalty, model.correlation_penalty, None, "PASS", DecisionAction.PASS, tuple(reasons), snapshot.source_reference, snapshot.observed_at_utc))
+                output.append(PricedSelection(snapshot.fixture_id, snapshot.id, group.market_key, snapshot.market_type, snapshot.settlement_type, snapshot.validation_status, snapshot.selection, snapshot.line, snapshot.decimal_odds, None, None, model.probability, None, None, model.uncertainty_penalty, model.data_quality_penalty, model.correlation_penalty, None, "PASS", DecisionAction.PASS, tuple(reasons), snapshot.source_reference, snapshot.observed_at_utc))
                 continue
             fair_odds, raw_ev, adjusted = calculate(model.probability, snapshot.decimal_odds, (model.uncertainty_penalty, model.data_quality_penalty, model.correlation_penalty))
             if snapshot.validation_status == "STALE": reasons.append(ReasonCode.STALE_MARKET_DATA)
@@ -91,5 +103,5 @@ class Phase1AnalysisService:
             hard = bool({ReasonCode.UNSUPPORTED_SETTLEMENT_MODEL, ReasonCode.STALE_MARKET_DATA, ReasonCode.UNVERIFIED_MARKET_DATA}.intersection(reasons))
             rating, action = rate(adjusted, snapshot.validation_status == "VALID" and not hard)
             if action is DecisionAction.WATCH: reasons.extend((ReasonCode.PHASE1_RATING_CAP, ReasonCode.PHASE1_EXECUTION_DISABLED))
-            output.append(PricedSelection(snapshot.fixture_id, snapshot.id, group.market_key, snapshot.market_type, snapshot.settlement_type, snapshot.selection, snapshot.line, snapshot.decimal_odds, implied_probability, devig_probability, model.probability, fair_odds, raw_ev, model.uncertainty_penalty, model.data_quality_penalty, model.correlation_penalty, adjusted, rating, action, tuple(dict.fromkeys(reasons)), snapshot.source_reference, snapshot.observed_at_utc))
+            output.append(PricedSelection(snapshot.fixture_id, snapshot.id, group.market_key, snapshot.market_type, snapshot.settlement_type, snapshot.validation_status, snapshot.selection, snapshot.line, snapshot.decimal_odds, implied_probability, devig_probability, model.probability, fair_odds, raw_ev, model.uncertainty_penalty, model.data_quality_penalty, model.correlation_penalty, adjusted, rating, action, tuple(dict.fromkeys(reasons)), snapshot.source_reference, snapshot.observed_at_utc))
         return tuple(output)

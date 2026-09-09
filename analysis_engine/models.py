@@ -33,6 +33,7 @@ class PricedSelection:
     market_key: str
     market_type: str
     settlement_type: str
+    validation_status: str
     selection: str
     line: float | None
     market_odds: float

@@ -8,8 +8,8 @@ from analysis_engine.service import InvalidProbabilityError, MarketGroupError, P
 from data_platform.read_api import ReadRepository
 
 
-def add(database, fixture, selection, odds, snapshot_id=None, market="moneyline"):
-    return database.append_market_snapshot(fixture_id=fixture, provider="test", source_reference="synthetic://odds", market_type=market, settlement_type="normal", selection=selection, line=None, decimal_odds=odds, observed_at_utc="2026-09-08T09:00:00+00:00", raw_payload_hash=selection, validation_status="VALID", mapping_version="v1")
+def add(database, fixture, selection, odds, snapshot_id=None, market="moneyline", status="VALID"):
+    return database.append_market_snapshot(fixture_id=fixture, provider="test", source_reference="synthetic://odds", market_type=market, settlement_type="normal", selection=selection, line=None, decimal_odds=odds, observed_at_utc="2026-09-08T09:00:00+00:00", raw_payload_hash=selection, validation_status=status, mapping_version="v1")
 
 
 def service(database): return Phase1AnalysisService(ReadRepository(database))
@@ -44,3 +44,10 @@ def test_player_market_is_unpriced_pass_and_never_selected(database, fixture_id)
     result = service(database).analyze(fixture_id=fixture_id, market_groups=(MarketGroup(fixture_id, "player", (a, b), True, True),), model_probabilities=(ModelProbability(a, .6), ModelProbability(b, .4)), generated_at_utc=datetime(2026, 9, 8, tzinfo=timezone.utc))
     assert result.selected is None
     assert all(item.raw_ev is None and item.fair_odds is None and ReasonCode.UNSUPPORTED_SETTLEMENT_MODEL in item.reason_codes for item in result.ranked_candidates)
+
+
+@pytest.mark.parametrize("status, code", [("STALE", ReasonCode.STALE_MARKET_DATA), ("UNMAPPED", ReasonCode.UNVERIFIED_MARKET_DATA)])
+def test_hard_data_quality_rejections_never_watch_or_select(database, fixture_id, status, code):
+    a, b = add(database, fixture_id, "home", 2.0, status=status), add(database, fixture_id, "away", 2.0, status=status)
+    result = service(database).analyze(fixture_id=fixture_id, market_groups=(MarketGroup(fixture_id, "q", (a,b), True, True),), model_probabilities=(ModelProbability(a,.55), ModelProbability(b,.45)), generated_at_utc=datetime(2026,9,8,tzinfo=timezone.utc))
+    assert result.selected is None and code in result.reason_codes
